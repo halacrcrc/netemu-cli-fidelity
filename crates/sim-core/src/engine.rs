@@ -4497,8 +4497,12 @@ impl Engine {
             let Some((u, du)) = next else { break };
             done.insert(u);
             let Some(lsa) = rt.lsdb.get(&u) else { continue };
-            for i in 0..lsa.neighbor_count as usize {
-                let v = lsa.neighbors[i];
+            for v in lsa
+                .neighbors
+                .iter()
+                .take(lsa.neighbor_count as usize)
+                .copied()
+            {
                 if v == [0; 6] || !rt.lsdb.contains_key(&v) {
                     continue;
                 }
@@ -4537,8 +4541,7 @@ impl Engine {
             let Some(lsa) = rt.lsdb.get(sid) else {
                 continue;
             };
-            for i in 0..lsa.link_count as usize {
-                let Some(link) = lsa.links[i] else { continue };
+            for link in lsa.links.iter().take(lsa.link_count as usize).flatten() {
                 if connected.contains(&(link.net, link.len)) || !seen.insert((link.net, link.len)) {
                     continue;
                 }
@@ -4928,8 +4931,12 @@ impl Engine {
             let Some((u, du)) = next else { break };
             done.insert(u);
             let Some(lsa) = rt.lsdb.get(&u) else { continue };
-            for i in 0..lsa.neighbor_count as usize {
-                let v = lsa.neighbors[i];
+            for v in lsa
+                .neighbors
+                .iter()
+                .take(lsa.neighbor_count as usize)
+                .copied()
+            {
                 if v == 0 || !rt.lsdb.contains_key(&v) {
                     continue;
                 }
@@ -4969,8 +4976,7 @@ impl Engine {
             let Some(lsa) = rt.lsdb.get(rid) else {
                 continue;
             };
-            for i in 0..lsa.link_count as usize {
-                let Some(link) = lsa.links[i] else { continue };
+            for link in lsa.links.iter().take(lsa.link_count as usize).flatten() {
                 if connected.contains(&(link.net, link.len)) || !seen.insert((link.net, link.len)) {
                     continue;
                 }
@@ -5163,10 +5169,13 @@ impl Engine {
             return;
         }
         let mut prefixes = Vec::new();
-        for i in 0..pkt.count.min(8) as usize {
-            if let Some((ip, len)) = pkt.prefixes[i] {
-                prefixes.push((ip, len));
-            }
+        for (ip, len) in pkt
+            .prefixes
+            .iter()
+            .take(pkt.count.min(8) as usize)
+            .filter_map(|e| *e)
+        {
+            prefixes.push((ip, len));
         }
         let rt = self.ospfv3.entry(dev).or_default();
         rt.neighbors.insert(
@@ -5696,11 +5705,8 @@ impl Engine {
             // End 节点处理完当前段后左移一格。
             outer.dst = *first;
             let rest = policy_segs.len().saturating_sub(1).min(3);
-            for (i, sid) in policy_segs.iter().skip(1).take(3).enumerate() {
+            for (i, sid) in policy_segs.iter().skip(1).take(rest).enumerate() {
                 outer.segments[i] = Some(*sid);
-            }
-            for i in rest..3 {
-                outer.segments[i] = None;
             }
             outer.segments_left = rest as u8;
         }
