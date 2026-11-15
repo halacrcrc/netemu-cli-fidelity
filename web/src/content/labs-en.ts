@@ -366,6 +366,47 @@ export const LABS_EN: Record<string, LabEn> = {
     ],
   },
 
+  ospfv3: {
+    title: 'Lab 21 · OSPFv3 Dynamic Routing',
+    brief:
+      'Three routers form a chain with a business subnet at each end. R1 and R3 are not directly connected — R3 learns the R1 subnet through OSPFv3 LSA flooding across the middle, and R2 maintains two neighbors at once. With OSPFv3 enabled, PC1 and PC2 can ping6 across all three routers.',
+    tasks: [
+      'Interface addresses (all undo shutdown): R1 g0/0/0 2001:db8:1::1/64, g0/0/1 2001:db8:12::1/64; R2 g0/0/0 2001:db8:12::2/64, g0/0/1 2001:db8:23::1/64; R3 g0/0/0 2001:db8:23::2/64, g0/0/1 2001:db8:3::1/64',
+      'R1/R2/R3: ospfv3 1 -> router-id 1.1.1.1 / 2.2.2.2 / 3.3.3.3',
+      'R1/R2/R3: run ospfv3 1 area 0 on the interconnect and service interfaces',
+      'display ospfv3 peer: R1/R3 each 1 neighbor, R2 should have 2 neighbors',
+      'display ipv6 routing-table: R3 should show the far subnet 2001:db8:1::/64 marked O — it was never directly connected',
+      'PC1: ping6 2001:db8:3::10 should succeed',
+    ],
+    checkLabels: [
+      'R1 forms an OSPFv3 neighbor',
+      'R2 keeps two neighbors (flooding relay)',
+      'R3 forms an OSPFv3 neighbor',
+      'PC1 -> PC2 ping6 across three routers succeeds',
+    ],
+  },
+
+  'srv6-be': {
+    title: 'Lab 22 · SRv6 BE & Policy Steering',
+    brief:
+      'PE1—P1—PE2 and PE1—P2—PE2 form a diamond dual-path IPv6 backbone, each edge attached to a business subnet. First get traffic through with SRv6 BE (single remote SID); then use an SRv6 Policy (color + end-point + segment list) to steer PE1 traffic for the business subnet onto the path via P2 — the SRH segment list is processed hop by hop on P2 (End) and decapsulated at PE2 (End.DT6). Capture the PE1—P2 link to see Policy-encapsulated packets.',
+    tasks: [
+      'Interface addresses (all undo shutdown): PE1 g0/0/0 2001:db8:1::1/64, g0/0/1 2001:db8:12::1/64 (P1), g0/0/2 2001:db8:14::1/64 (P2); P1 g0/0/0 2001:db8:12::2/64, g0/0/1 2001:db8:23::1/64; P2 g0/0/0 2001:db8:14::2/64, g0/0/1 2001:db8:24::1/64; PE2 g0/0/0 2001:db8:23::2/64, g0/0/1 2001:db8:24::2/64, g0/0/2 2001:db8:2::1/64',
+      'Locator/SID: PE1 srv6 locator 2001:db8:100::/64 + srv6 sid 2001:db8:100::1; PE2 srv6 locator 2001:db8:200::/64 + srv6 sid 2001:db8:200::1; P2 srv6 locator 2001:db8:400::/64 + srv6 sid 2001:db8:400::2 (the policy mid-hop needs End processing)',
+      'Underlay routes (all ipv6 route-static): PE1 -> 400::/64 via 2001:db8:14::2, 200::/64 via 2001:db8:12::2; P1 -> 200::/64 via 2001:db8:23::2, 100::/64 via 2001:db8:12::1; P2 -> 200::/64 via 2001:db8:24::2, 100::/64 via 2001:db8:14::1; PE2 -> 400::/64 via 2001:db8:24::1, 100::/64 via 2001:db8:23::2',
+      'SRv6 BE: PE1 srv6 route 2001:db8:2::/64 sid 2001:db8:200::1; PE2 srv6 route 2001:db8:1::/64 sid 2001:db8:100::1',
+      'SRv6 Policy (PE1): srv6 policy POL1 color 100 end-point 2001:db8:200::1 -> segment-list 2001:db8:400::2 2001:db8:200::1 (first hop via P2 End, final segment is PE2) -> quit; then srv6 route 2001:db8:2::/64 policy POL1',
+      'Verify: ping6 2001:db8:400::2 (from PE1, P2 SID reachable); PC1 ping6 2001:db8:2::10 should succeed — traffic follows the Policy path PE1->P2->PE2; capture the PE1—P2 link to see Policy-encapsulated packets',
+    ],
+    checkLabels: [
+      'PE1 has SRv6 Policy POL1 (end-point = PE2 SID)',
+      'PE1 business prefix references the Policy',
+      'PE2 has the return BE route',
+      'Underlay reachable (PE1 -> P2 SID)',
+      'PC1 -> PC2 reachable via the SRv6 Policy path',
+    ],
+  },
+
   'dc-comprehensive': {
     title: 'Lab 23 · Data Center Comprehensive (M-LAG + VXLAN + F5)',
     brief:

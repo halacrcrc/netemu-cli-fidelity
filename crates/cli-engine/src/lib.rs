@@ -122,6 +122,8 @@ pub struct SubCtx {
     pub rule: Option<String>,
     /// IPsec 隧道视图中的隧道名
     pub ipsec: Option<String>,
+    /// SRv6 Policy 视图中正在编辑的策略名
+    pub srv6_policy: Option<String>,
 }
 
 /// 远程登录输入流程。
@@ -204,6 +206,8 @@ pub enum Mode {
     SecurityPolicy,
     /// 安全策略规则视图
     SecurityRule,
+    /// SRv6 Policy 视图
+    Srv6Policy,
     /// IPsec 隧道视图
     Ipsec,
     /// OSPFv3 进程视图

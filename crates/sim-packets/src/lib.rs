@@ -454,12 +454,17 @@ pub struct Ospfv3Packet {
     pub count: u8,
 }
 
-/// SRv6 BE：外层 IPv6（目的为 SID）+ 内层原始 IPv6 报文。
+/// SRv6 BE/Policy：外层 IPv6（目的为第一段或远端 SID）+ 内层原始 IPv6 报文。
+/// SRH 教学简化：段列表固定 3 槽，`segments[segments_left - 1]` 为下一待处理段（SRH 逆序语义的内部简化）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Srv6Packet {
     pub src: Ipv6Addr,
     pub dst: Ipv6Addr,
     pub hop_limit: u8,
+    #[serde(default)]
+    pub segments: [Option<Ipv6Addr>; 3],
+    #[serde(default)]
+    pub segments_left: u8,
     pub inner: Ipv6Packet,
 }
 

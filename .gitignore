@@ -10,3 +10,15 @@ web/src/wasm/
 .vscode/
 .idea/
 .zcode/
+
+# 华讯模板文档生成（公司模板拆解件与构建标记不入库）
+scratch/
+build/__pycache__/
+build/.last_build
+
+# 公司模板资产与内部指南不入公共仓库（docs/ 下两件 + scratch/ 拆解件）
+docs/华讯知识模板格式规范v2.5.docm
+docs/华讯模板文档生成指南.md
+
+# 生成的 docx 内嵌公司模板资产（页眉横幅/样式/页脚），同样不入公共仓库
+网工模拟器使用与实验指南.docx

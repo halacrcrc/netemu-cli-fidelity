@@ -408,8 +408,21 @@ pub fn render(d: &DevSummary, dialect: Dialect) -> String {
     for sid in &d.srv6_sids {
         out.push(format!("srv6 sid {}", sid));
     }
+    for pol in &d.srv6_policies {
+        out.push(format!(
+            "srv6 policy {} color {} end-point {}",
+            pol.name, pol.color, pol.endpoint
+        ));
+        let segs = pol.segments.join(" ");
+        if !segs.is_empty() {
+            out.push(format!(" segment-list {}", segs));
+        }
+    }
     for r in &d.srv6_routes {
-        out.push(format!("srv6 route {}/{} sid {}", r.dst, r.len, r.sid));
+        match &r.policy {
+            Some(name) => out.push(format!("srv6 route {}/{} policy {}", r.dst, r.len, name)),
+            None => out.push(format!("srv6 route {}/{} sid {}", r.dst, r.len, r.sid)),
+        }
     }
     // 防火墙策略
     for sp in &d.security_policies {

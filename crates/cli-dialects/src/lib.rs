@@ -43,6 +43,7 @@ pub struct Trees {
     pub security_rule: Vec<cli_engine::CNode>,
     pub ipsec: Vec<cli_engine::CNode>,
     pub ospfv3: Vec<cli_engine::CNode>,
+    pub srv6_policy: Vec<cli_engine::CNode>,
 }
 
 impl Trees {
@@ -67,6 +68,7 @@ impl Trees {
             Mode::SecurityRule => &self.security_rule,
             Mode::Ipsec => &self.ipsec,
             Mode::Ospfv3 => &self.ospfv3,
+            Mode::Srv6Policy => &self.srv6_policy,
         }
     }
 }
@@ -1409,9 +1411,91 @@ pub mod cmd {
         if let Some(d) = c.eng.net.device_mut(c.dev) {
             if let DeviceState::Router(rs) = &mut d.state {
                 rs.srv6.routes.retain(|r| !(r.dst == dst && r.len == len));
-                rs.srv6
-                    .routes
-                    .push(sim_core::device::Srv6Route { dst, len, sid });
+                rs.srv6.routes.push(sim_core::device::Srv6Route {
+                    dst,
+                    len,
+                    sid,
+                    policy: None,
+                });
+            }
+        }
+        Ok(String::new())
+    }
+
+    /// `srv6 policy POL1 color 100 end-point 2001:db8:200::1`：进入 Policy 视图并登记。
+    pub fn srv6_policy_enter(c: &mut Ctx) -> Result<String, CliError> {
+        let name = c.word("name");
+        if name.is_empty() {
+            return Err(CliError::Custom("Policy name is required".into()));
+        }
+        let color = c.number("color").unwrap_or(0);
+        let endpoint = sim_packets::ipv6_from_str(&c.word("endpoint"))
+            .ok_or_else(|| CliError::Custom("Invalid end-point".into()))?;
+        if let Some(d) = c.eng.net.device_mut(c.dev) {
+            if let DeviceState::Router(rs) = &mut d.state {
+                rs.srv6.policies.retain(|p| p.name != name);
+                rs.srv6.policies.push(sim_core::device::Srv6Policy {
+                    name: name.clone(),
+                    color,
+                    endpoint,
+                    segments: vec![],
+                });
+            }
+        }
+        c.sess.mode = Mode::Srv6Policy;
+        c.sess.sub.srv6_policy = Some(name);
+        Ok(String::new())
+    }
+
+    /// Policy 视图下 `segment-list <sid1> <sid2> ...`：按遍历顺序写入段列表。
+    pub fn srv6_policy_segment_list(c: &mut Ctx) -> Result<String, CliError> {
+        let sids: Vec<sim_packets::Ipv6Addr> = c
+            .word_list("segments")
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|s| sim_packets::ipv6_from_str(s))
+            .collect();
+        if sids.is_empty() {
+            return Err(CliError::Custom("Invalid segment list".into()));
+        }
+        let Some(name) = c.sess.sub.srv6_policy.clone() else {
+            return Err(CliError::Custom("No policy selected".into()));
+        };
+        if let Some(d) = c.eng.net.device_mut(c.dev) {
+            if let DeviceState::Router(rs) = &mut d.state {
+                if let Some(p) = rs.srv6.policies.iter_mut().find(|p| p.name == name) {
+                    p.segments = sids;
+                }
+            }
+        }
+        Ok(String::new())
+    }
+
+    /// `srv6 route <prefix> policy POL1`：业务前缀引用 Policy（外层目的 = Policy 端点）。
+    pub fn srv6_route_policy(c: &mut Ctx) -> Result<String, CliError> {
+        let (dst, len) = ipv6_prefix_arg(c, "prefix")?;
+        let name = c.word("policy");
+        if name.is_empty() {
+            return Err(CliError::Custom("Policy name is required".into()));
+        }
+        if let Some(d) = c.eng.net.device_mut(c.dev) {
+            if let DeviceState::Router(rs) = &mut d.state {
+                let Some(endpoint) = rs
+                    .srv6
+                    .policies
+                    .iter()
+                    .find(|p| p.name == name)
+                    .map(|p| p.endpoint)
+                else {
+                    return Err(CliError::Custom(format!("Policy {} not found", name)));
+                };
+                rs.srv6.routes.retain(|r| !(r.dst == dst && r.len == len));
+                rs.srv6.routes.push(sim_core::device::Srv6Route {
+                    dst,
+                    len,
+                    sid: endpoint,
+                    policy: Some(name),
+                });
             }
         }
         Ok(String::new())
@@ -3529,6 +3613,7 @@ pub fn prompt(eng: &Engine, sess: &Session, dev: DevId) -> String {
             Mode::SecurityPolicy => format!("{}(config-sec-policy)#", d.name),
             Mode::SecurityRule => format!("{}(config-zone-pair)#", d.name),
             Mode::Ipsec => format!("{}(config-ipsec)#", d.name),
+            Mode::Srv6Policy => format!("{}(config-srv6-policy)#", d.name),
         },
         Dialect::Vrp | Dialect::Comware => match sess.mode {
             Mode::Exec | Mode::Priv => format!("<{}>", d.name),
@@ -3596,6 +3681,11 @@ pub fn prompt(eng: &Engine, sess: &Session, dev: DevId) -> String {
                 sess.sub.ipsec.clone().unwrap_or_default()
             ),
             Mode::Ospfv3 => format!("[{}-ospfv3-1]", d.name),
+            Mode::Srv6Policy => format!(
+                "[{}-srv6-policy-{}]",
+                d.name,
+                sess.sub.srv6_policy.clone().unwrap_or_default()
+            ),
         },
     }
 }
