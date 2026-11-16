@@ -399,10 +399,8 @@ pub fn render(d: &DevSummary, dialect: Dialect) -> String {
         out.push(format!("stack priority {}", st.priority));
     }
     // enable secret（IOS）
-    if dialect == Dialect::Ios {
-        if let Some(_) = d.mgmt.enable_secret.as_ref() {
-            out.push("enable secret ***".into());
-        }
+    if dialect == Dialect::Ios && d.mgmt.enable_secret.is_some() {
+        out.push("enable secret ***".into());
     }
     // VRF 静态路由
     for v in &d.vrfs {
