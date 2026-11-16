@@ -354,6 +354,9 @@ pub struct EvpnPacket {
     pub vtep_ip: Ipv4Addr,
     pub vni: u32,
     pub vlan: u16,
+    /// Underlay 转发 TTL（每跳递减；无 SRH 的 EVPN 通告帧防环）。
+    #[serde(default)]
+    pub ttl: u8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -455,7 +458,7 @@ pub struct Ospfv3Packet {
 }
 
 /// SRv6 BE/Policy：外层 IPv6（目的为第一段或远端 SID）+ 内层原始 IPv6 报文。
-/// SRH 教学简化：段列表固定 3 槽，`segments[segments_left - 1]` 为下一待处理段（SRH 逆序语义的内部简化）。
+/// SRH 教学简化（队列语义）：段列表固定 3 槽，`segments[0]` 为下一个待处理段；`segments_left` 为剩余段数。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Srv6Packet {
     pub src: Ipv6Addr,

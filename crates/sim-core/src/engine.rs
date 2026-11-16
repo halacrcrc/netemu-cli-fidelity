@@ -619,7 +619,11 @@ impl Engine {
         }
         // 0d. EVPN：VTEP 控制面；Underlay 路由器按外层单播转发
         if let L3::Evpn(e) = frame.payload {
-            if !self.encap_fwd_over_underlay(dev_id, in_port, e.dst, DEFAULT_TTL, L3::Evpn(e)) {
+            let fwd = EvpnPacket {
+                ttl: e.ttl.saturating_sub(1),
+                ..e
+            };
+            if !self.encap_fwd_over_underlay(dev_id, in_port, e.dst, e.ttl, L3::Evpn(fwd)) {
                 self.evpn_on_packet(dev_id, e);
             }
             return;
@@ -3118,6 +3122,7 @@ impl Engine {
                     vtep_ip: local,
                     vni: *vni,
                     vlan: *vlan,
+                    ttl: 64,
                 };
                 let frame = EthernetFrame {
                     dst: BROADCAST_MAC,
@@ -5332,6 +5337,11 @@ impl Engine {
             (s.target, s.sent)
         };
         let Some((port, arp_for, src)) = self.route_for_ping6(dev, target) else {
+            // 无路由：标记会话完成并吐出，避免会话泄漏挂起
+            if let Some(s) = self.ping6_session_mut(dev, sid) {
+                s.done = true;
+                s.reported = true;
+            }
             return;
         };
         {

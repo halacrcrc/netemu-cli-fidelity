@@ -386,7 +386,63 @@ export const LABS_EN: Record<string, LabEn> = {
     ],
   },
 
-  'srv6-be': {
+  'stack-irf': {
+    title: 'Lab 16 · Stacking / IRF (One Logical Switch)',
+    brief:
+      'Two switches share a stack domain and become one logical switch: member links are treated as internal fabric and are not blocked by STP, so PCs under different members communicate in the same VLAN.',
+    tasks: [
+      'SW1: stack domain 10 -> stack member 1 -> stack priority 200',
+      'SW2: stack domain 10 -> stack member 2 -> stack priority 100',
+      'SW1/SW2: vlan batch 10; PC-facing ports access VLAN10',
+      'SW1/SW2: interconnect ports as trunk allowing vlan 10',
+      'display stack should show domain 10, both members, and SW1 as Master',
+      'PC1 ping 192.168.10.12 should succeed (Layer 2 across stack members)',
+    ],
+    checkLabels: [
+      'SW1 is member 1 of stack domain 10',
+      'SW2 is member 2 of stack domain 10',
+      'PC1 -> PC2 reachable across stack members',
+    ],
+  },
+'port-isolation': {
+    title: 'Lab 20 · MUX VLAN and Port Isolation',
+    brief:
+      'Isolate ports inside one VLAN: PC1 (separate) cannot reach PC2 (group), but both can reach PC3 (principal). This is the core behavior of MUX VLAN / private VLAN.',
+    tasks: [
+      'SW1: vlan batch 10; G0/0/1 to PC1, G0/0/2 to PC2, G0/0/3 to PC3, all access VLAN10',
+      'SW1: G0/0/1 -> mux-vlan separate; G0/0/2 -> mux-vlan group 1; G0/0/3 -> mux-vlan principal',
+      '(Optional) run port-isolate enable group 1 on PC1/PC2 ports and observe the same isolation',
+      'Check port roles with display mux-vlan / display port-isolate',
+      'PC1 -> PC2 should fail; PC1 -> PC3 and PC2 -> PC3 should succeed',
+    ],
+    checkLabels: [
+      'G0/0/1 is a separate port',
+      'G0/0/2 is a group 1 port',
+      'G0/0/3 is a principal port',
+      'PC1 -> PC2 is isolated',
+      'PC1 -> PC3 (principal) is reachable',
+    ],
+  },
+'f5-ltm': {
+    title: 'Lab 19 · F5 LTM Load Balancing',
+    brief:
+      'The F5 load balancer exposes VIP 10.0.0.100:80 to clients with a two-member backend pool. Client TCP connections to the VIP are load-balanced round-robin with destination and return source translation.',
+    tasks: [
+      'LB1: G0/0/0 client side 10.0.0.1/24; G0/0/1 to SRV1 10.0.1.1/24; G0/0/2 to SRV2 10.0.2.1/24, all undo shutdown',
+      'LB1: ltm pool WEB member 10.0.1.10 80',
+      'LB1: ltm pool WEB member 10.0.2.11 80',
+      'LB1: ltm virtual VS vip 10.0.0.100 80 pool WEB',
+      'display ltm should show VS -> WEB and both pool members',
+      'PC1: run tcp 10.0.0.100 80 twice; both should report a successful connection',
+      'display ltm: two sessions should appear, pointing to different members (round-robin)',
+    ],
+    checkLabels: [
+      'LB1 virtual server VS = 10.0.0.100:80',
+      'PC1 first connection to the VIP succeeds',
+      'PC1 second connection to the VIP succeeds',
+    ],
+  },
+'srv6-be': {
     title: 'Lab 22 · SRv6 BE & Policy Steering',
     brief:
       'PE1—P1—PE2 and PE1—P2—PE2 form a diamond dual-path IPv6 backbone, each edge attached to a business subnet. First get traffic through with SRv6 BE (single remote SID); then use an SRv6 Policy (color + end-point + segment list) to steer PE1 traffic for the business subnet onto the path via P2 — the SRH segment list is processed hop by hop on P2 (End) and decapsulated at PE2 (End.DT6). Capture the PE1—P2 link to see Policy-encapsulated packets.',
@@ -396,7 +452,7 @@ export const LABS_EN: Record<string, LabEn> = {
       'Underlay routes (all ipv6 route-static): PE1 -> 400::/64 via 2001:db8:14::2, 200::/64 via 2001:db8:12::2; P1 -> 200::/64 via 2001:db8:23::2, 100::/64 via 2001:db8:12::1; P2 -> 200::/64 via 2001:db8:24::2, 100::/64 via 2001:db8:14::1; PE2 -> 400::/64 via 2001:db8:24::1, 100::/64 via 2001:db8:23::2',
       'SRv6 BE: PE1 srv6 route 2001:db8:2::/64 sid 2001:db8:200::1; PE2 srv6 route 2001:db8:1::/64 sid 2001:db8:100::1',
       'SRv6 Policy (PE1): srv6 policy POL1 color 100 end-point 2001:db8:200::1 -> segment-list 2001:db8:400::2 2001:db8:200::1 (first hop via P2 End, final segment is PE2) -> quit; then srv6 route 2001:db8:2::/64 policy POL1',
-      'Verify: ping6 2001:db8:400::2 (from PE1, P2 SID reachable); PC1 ping6 2001:db8:2::10 should succeed — traffic follows the Policy path PE1->P2->PE2; capture the PE1—P2 link to see Policy-encapsulated packets',
+      'Verify: from PE1 ping ipv6 2001:db8:400::2 should succeed (P2 SID reachable); PC1 ping6 2001:db8:2::10 should succeed — traffic follows the Policy path PE1->P2->PE2; capture the PE1—P2 link to see Policy-encapsulated packets',
     ],
     checkLabels: [
       'PE1 has SRv6 Policy POL1 (end-point = PE2 SID)',
@@ -413,7 +469,7 @@ export const LABS_EN: Record<string, LabEn> = {
       'A Spine-Leaf style data center tying M8 together: access switch SW1 dual-homes over LACP to the DSW1/DSW2 M-LAG pair, both M-LAG members act as VTEPs whose VXLAN crosses a SPINE router (IPv4 underlay) to reach DSW3 on the server side, and F5 LTM fronts the real servers with a VIP. One TCP connection from an app server to the VIP crosses M-LAG dual-homing, VXLAN encapsulation, underlay routing, and LTM translation.',
     tasks: [
       'Access: SW1 vlan batch 10 -> stp disable (M-LAG dual-homing does not rely on STP); app ports access VLAN10',
-      'SW1 dual-homing: interface eth-trunk 1 -> mode lacp-static -> G0/0/2 (to DSW1) and G0/0/3 (to DSW2) join eth-trunk 1, both trunk allow-pass vlan 10',
+      'SW1 dual-homing: interface eth-trunk 1 -> mode lacp-static -> G0/0/3 (to DSW1) and G0/0/4 (to DSW2) join eth-trunk 1, both trunk allow-pass vlan 10',
       'M-LAG pair: DSW1/DSW2 vlan batch 10 -> mlag domain 1 -> interconnect (peer-link) trunk allow-pass vlan 10 and mlag peer-link',
       'M-LAG uplinks: eth-trunk 1 on DSW1/DSW2 (G0/0/1) trunk allow-pass vlan 10, both links forwarding',
       'Underlay: DSW1 vlan 100 -> vlanif100 10.0.0.1/24 to SPINE G0/0/0 10.0.0.2/24; DSW2 vlan 100 -> vlanif100 10.0.1.2/24 to SPINE G0/0/1 10.0.1.1/24; DSW3 vlan 100 -> vlanif100 10.0.2.2/24 to SPINE G0/0/2 10.0.2.1/24 (all undo shutdown)',

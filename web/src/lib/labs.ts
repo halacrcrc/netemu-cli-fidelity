@@ -1460,7 +1460,7 @@ export const lab22: LabDef = {
     'Underlay 路由（全部 ipv6 route-static）：PE1 → 400::/64 via 2001:db8:14::2、200::/64 via 2001:db8:12::2；P1 → 200::/64 via 2001:db8:23::2、100::/64 via 2001:db8:12::1；P2 → 200::/64 via 2001:db8:24::2、100::/64 via 2001:db8:14::1；PE2 → 400::/64 via 2001:db8:24::1、100::/64 via 2001:db8:23::2',
     'SRv6 BE：PE1 srv6 route 2001:db8:2::/64 sid 2001:db8:200::1；PE2 srv6 route 2001:db8:1::/64 sid 2001:db8:100::1',
     'SRv6 Policy（PE1）：srv6 policy POL1 color 100 end-point 2001:db8:200::1 → segment-list 2001:db8:400::2 2001:db8:200::1（第一段经 P2 的 End，最终段为 PE2）→ quit；再 srv6 route 2001:db8:2::/64 policy POL1',
-    '验证：ping6 2001:db8:400::2（从 PE1，P2 的 SID 可达）；PC1 ping6 2001:db8:2::10 应通——流量按 Policy 走 PE1→P2→PE2；抓包 PE1—P2 链路能看到 Policy 封装报文',
+    '验证：从 PE1 ping ipv6 2001:db8:400::2 应通（P2 的 SID 可达）；PC1 ping6 2001:db8:2::10 应通——流量按 Policy 走 PE1→P2→PE2；抓包 PE1—P2 链路能看到 Policy 封装报文',
   ],
   checks: [
     { label: 'PE1 配置 SRv6 Policy POL1（端点 = PE2 的 SID）', kind: { type: 'srv6Policy', dev: 'PE1', name: 'POL1', endpoint: '2001:db8:200::1' } },
@@ -1506,7 +1506,7 @@ export const lab23: LabDef = {
     '把 M8 的数据中心技术串成一个 Spine-Leaf 组网：接入交换机 SW1 用 LACP 双归到 DSW1/DSW2 组成的 M-LAG 对，两台 M-LAG 成员作为 VTEP 与另一侧的 DSW3 跨过 SPINE 路由器（IPv4 Underlay）建 VXLAN 隧道，业务 VLAN10 二层延伸到服务器侧；F5 LTM 对外提供 VIP，把应用流量轮询交付给两台真实服务器。一台应用服务器到 VIP 的 TCP 连接要穿过 M-LAG 双归、VXLAN 封装、Underlay 路由与 LTM 转换四层机制。',
   tasks: [
     '接入层：SW1 vlan batch 10 → stp disable（M-LAG 双归不依赖 STP）；APP1/APP2 的接入口 access VLAN10',
-    'SW1 双归：interface eth-trunk 1 → mode lacp-static → G0/0/2（接 DSW1）、G0/0/3（接 DSW2）分别 eth-trunk 1，两口 trunk allow-pass vlan 10',
+    'SW1 双归：interface eth-trunk 1 → mode lacp-static → G0/0/3（接 DSW1）、G0/0/4（接 DSW2）分别 eth-trunk 1，两口 trunk allow-pass vlan 10',
     'M-LAG 对：DSW1/DSW2 vlan batch 10 → mlag domain 1 → 互连接口（peer-link）trunk allow-pass vlan 10 并 mlag peer-link',
     'M-LAG 对上联：DSW1/DSW2 的 eth-trunk 1（G0/0/1）trunk allow-pass vlan 10，双归口同时转发',
     'Underlay：DSW1 vlan 100 → vlanif100 10.0.0.1/24 接 SPINE G0/0/0 10.0.0.2/24；DSW2 vlan 100 → vlanif100 10.0.1.2/24 接 SPINE G0/0/1 10.0.1.1/24；DSW3 vlan 100 → vlanif100 10.0.2.2/24 接 SPINE G0/0/2 10.0.2.1/24（均 undo shutdown）',

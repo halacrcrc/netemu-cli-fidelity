@@ -180,7 +180,7 @@ F5 LTM：新增 `DeviceKind::LoadBalancer`（复用 RouterState），Device 增�
 
 **OSPFv3**：新增 `Ospfv3Packet`（Router ID/Area/源 IPv6/前缀数组）与独立 `Ospfv3Runtime`；接口 `ospfv3 1 area 0` 启用后周期发送本机前缀，邻居学习前缀并安装 `Route6`（`RouteSrc::Ospf`）。`lookup_route6` 将 OSPFv3 路由排在静态之后、直连之前。简化：不做完整 LSA 泛洪、DR/BDR、区域间汇总、LSA 老化与认证（认证交给 IPv6 IPsec）；前缀学习经 D33 增强后可穿越中间路由器（带水平分割的泛洪），仍无 DR/BDR 与区域间汇总。
 
-**SRv6 BE**：`RouterState.srv6 { locator, sids, routes }`；命令 `srv6 locator`、`srv6 sid`、`srv6 route ... sid`。入口匹配业务前缀后封装 `Srv6Packet`（外层 IPv6 目的=SID，内层原始 IPv6），Underlay 用 `lookup_route6` 转发；目的 SID 属于本机 locator/SID 时解封装并按内层 IPv6 转发。不做 SRH、多段 Segment List、SRv6 Policy/TE、TI-LFA、切片与头压缩；BE 外层用广播 MAC 发送（同 IPsec 教学模型），依赖 Underlay 路由可达 SID。
+**SRv6 BE**：`RouterState.srv6 { locator, sids, routes }`；命令 `srv6 locator`、`srv6 sid`、`srv6 route ... sid`。入口匹配业务前缀后封装 `Srv6Packet`（外层 IPv6 目的=SID，内层原始 IPv6），Underlay 用 `lookup_route6` 转发；目的 SID 属于本机 locator/SID 时解封装并按内层 IPv6 转发。不做 SRH 完整实现（TLV/多协议）、SRv6 TE、TI-LFA 与切片；**SRv6 Policy（SRH 段列表 + End/End.DT6，M9o）已支持**：外层目的=第一段，End 节点左移段队列，最终段解封装；段列表上限 4（教学拓扑）。BE 外层用广播 MAC 发送（同 IPsec 教学模型），依赖 Underlay 路由可达 SID。
 
 **拓扑与 STP**：前端 `add_device`/`add_link`/`remove_link` 后调用 `Engine::topology_changed()` 重算 STP 并启动 hello 定时器；`lab_checks::run_checks` 先推进 45s 虚拟时间，等 STP 从 Listening/Learning 进入 Forwarding，避免判分时端口仍在 Learning 被误判为不通。
 

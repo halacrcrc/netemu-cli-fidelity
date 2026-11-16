@@ -5,7 +5,7 @@
   import { CMDMAP, type CmdRow } from '../content/cmdmap';
   import { renderMarkdown } from '../lib/md';
   import { getSim } from '../lib/sim';
-  import { app } from '../lib/store.svelte';
+  import { app, setViewName } from '../lib/store.svelte';
   import { LABS, labTitle } from '../lib/labs';
   let currentId = $state(LESSONS[0]?.id ?? '');
   const current = $derived(LESSONS.find((l) => l.id === currentId) ?? LESSONS[0]);
@@ -55,9 +55,11 @@
 
   function openLab() {
     if (!current?.lab) return;
-    app.view = 'lab';
-    // 实验加载交给 LeftPanel：这里用自定义事件简化
-    window.dispatchEvent(new CustomEvent('netemu:open-lab', { detail: current.lab }));
+    setViewName('lab');
+    // LeftPanel 在 lab 视图挂载后 $effect 才注册监听——宏任务派发确保 Svelte flush 完成
+    setTimeout(() => {
+      window.dispatchEvent(new CustomEvent('netemu:open-lab', { detail: current.lab }));
+    }, 0);
   }
 </script>
 

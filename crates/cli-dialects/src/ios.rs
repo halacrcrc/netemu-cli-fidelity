@@ -48,7 +48,8 @@ fn h_exit(c: &mut Ctx) -> Result<String, CliError> {
         | Mode::SecurityPolicy
         | Mode::SecurityRule
         | Mode::Ipsec
-        | Mode::Ospfv3 => Mode::Config,
+        | Mode::Ospfv3
+        | Mode::Srv6Policy => Mode::Config,
         _ => Mode::Exec,
     };
     if c.sess.mode != Mode::If {

@@ -1449,14 +1449,23 @@ pub mod cmd {
 
     /// Policy 视图下 `segment-list <sid1> <sid2> ...`：按遍历顺序写入段列表。
     pub fn srv6_policy_segment_list(c: &mut Ctx) -> Result<String, CliError> {
-        let sids: Vec<sim_packets::Ipv6Addr> = c
-            .word_list("segments")
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|s| sim_packets::ipv6_from_str(s))
-            .collect();
+        let raw: Vec<String> = c.word_list("segments").unwrap_or_default();
+        let mut sids: Vec<sim_packets::Ipv6Addr> = Vec::new();
+        for tok in &raw {
+            match sim_packets::ipv6_from_str(tok) {
+                Some(ip) => sids.push(ip),
+                None => {
+                    return Err(CliError::Custom(format!("Invalid SID: {}", tok)));
+                }
+            }
+        }
         if sids.is_empty() {
             return Err(CliError::Custom("Invalid segment list".into()));
+        }
+        if sids.len() > 4 {
+            return Err(CliError::Custom(
+                "Too many segments (max 4 after the first hop)".into(),
+            ));
         }
         let Some(name) = c.sess.sub.srv6_policy.clone() else {
             return Err(CliError::Custom("No policy selected".into()));

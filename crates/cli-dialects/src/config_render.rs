@@ -388,8 +388,8 @@ pub fn render(d: &DevSummary, dialect: Dialect) -> String {
         out.push(format!("mlag domain {}", m.domain));
         for p in &m.peer_links {
             out.push(format!(
-                "interface GigabitEthernet0/0/{} mlag peer-link",
-                p + 1
+                "interface {} mlag peer-link",
+                ifname::canonical(dialect, d.kind, *p)
             ));
         }
     }
@@ -397,6 +397,54 @@ pub fn render(d: &DevSummary, dialect: Dialect) -> String {
         out.push(format!("stack domain {}", st.domain));
         out.push(format!("stack member {}", st.member));
         out.push(format!("stack priority {}", st.priority));
+    }
+    // enable secret（IOS）
+    if dialect == Dialect::Ios {
+        if let Some(_) = d.mgmt.enable_secret.as_ref() {
+            out.push("enable secret ***".into());
+        }
+    }
+    // VRF 静态路由
+    for v in &d.vrfs {
+        out.push(format!("ip vpn-instance {}", v.name));
+        for r in &v.static_routes {
+            out.push(format!(
+                " ip route-static {} {} {}",
+                r.dst, r.len, r.nexthop
+            ));
+        }
+        out.push(" quit".into());
+    }
+    // MPLS 静态 LSP
+    for l in &d.mpls_lsps {
+        out.push(format!(
+            "static-lsp {} in-label {} out-label {} nexthop {}",
+            l.name,
+            l.in_label.unwrap_or(0),
+            l.out_label.unwrap_or(0),
+            l.nexthop.clone().unwrap_or_default()
+        ));
+    }
+    // 路由策略（占位：节点细节以 display route-policy 呈现）
+    for rp in &d.route_policies {
+        out.push(format!("route-policy {} ...", rp.name));
+    }
+    // IPsec 隧道
+    for t in &d.ipsec_tunnels {
+        out.push(format!(
+            "ipsec tunnel {} local {} remote {}",
+            t.name, t.local, t.remote
+        ));
+        out.push(format!(
+            " local-subnet {} {} remote-subnet {} {}",
+            t.local_subnet, t.local_len, t.remote_subnet, t.remote_len
+        ));
+    }
+    // WLAN（占位：profile 细节以 display wlan 呈现）
+    if let Some(w) = &d.wlan {
+        if w.capwap_ac.is_some() {
+            out.push("capwap ac ***".into());
+        }
     }
     // IS-IS / SRv6
     if let Some(net) = &d.isis_net {
