@@ -63,6 +63,8 @@ pub struct Trees {
     pub policy_map: Vec<cli_engine::CNode>,
     /// 阶段 6B：IOS ZBF `(config-pmap-c)#`。
     pub policy_map_class: Vec<cli_engine::CNode>,
+    /// SRv6 Policy 视图（`srv6-policy name X`）。
+    pub srv6_policy: Vec<cli_engine::CNode>,
 }
 
 impl Trees {
@@ -93,6 +95,7 @@ impl Trees {
             Mode::ClassMap => &self.class_map,
             Mode::PolicyMap => &self.policy_map,
             Mode::PolicyMapClass => &self.policy_map_class,
+            Mode::Srv6Policy => &self.srv6_policy,
         }
     }
 }
@@ -1981,9 +1984,100 @@ pub mod cmd {
         if let Some(d) = c.eng.net.device_mut(c.dev) {
             if let DeviceState::Router(rs) = &mut d.state {
                 rs.srv6.routes.retain(|r| !(r.dst == dst && r.len == len));
-                rs.srv6
-                    .routes
-                    .push(sim_core::device::Srv6Route { dst, len, sid });
+                rs.srv6.routes.push(sim_core::device::Srv6Route {
+                    dst,
+                    len,
+                    sid,
+                    policy: None,
+                });
+            }
+        }
+        Ok(String::new())
+    }
+
+    /// `srv6 policy POL1 color 100 end-point 2001:db8:200::1`：进入 Policy 视图并登记。
+    pub fn srv6_policy_enter(c: &mut Ctx) -> Result<String, CliError> {
+        let name = c.word("name");
+        if name.is_empty() {
+            return Err(CliError::Custom("Policy name is required".into()));
+        }
+        let color = c.number("color").unwrap_or(0);
+        let endpoint = sim_packets::ipv6_from_str(&c.word("endpoint"))
+            .ok_or_else(|| CliError::Custom("Invalid end-point".into()))?;
+        if let Some(d) = c.eng.net.device_mut(c.dev) {
+            if let DeviceState::Router(rs) = &mut d.state {
+                rs.srv6.policies.retain(|p| p.name != name);
+                rs.srv6.policies.push(sim_core::device::Srv6Policy {
+                    name: name.clone(),
+                    color,
+                    endpoint,
+                    segments: vec![],
+                });
+            }
+        }
+        c.sess.mode = Mode::Srv6Policy;
+        c.sess.sub.srv6_policy = Some(name);
+        Ok(String::new())
+    }
+
+    /// Policy 视图下 `segment-list <sid1> <sid2> ...`：按遍历顺序写入段列表。
+    pub fn srv6_policy_segment_list(c: &mut Ctx) -> Result<String, CliError> {
+        let raw: Vec<String> = c.word_list("segments").unwrap_or_default();
+        let mut sids: Vec<sim_packets::Ipv6Addr> = Vec::new();
+        for tok in &raw {
+            match sim_packets::ipv6_from_str(tok) {
+                Some(ip) => sids.push(ip),
+                None => {
+                    return Err(CliError::Custom(format!("Invalid SID: {}", tok)));
+                }
+            }
+        }
+        if sids.is_empty() {
+            return Err(CliError::Custom("Invalid segment list".into()));
+        }
+        if sids.len() > 4 {
+            return Err(CliError::Custom(
+                "Too many segments (max 4 after the first hop)".into(),
+            ));
+        }
+        let Some(name) = c.sess.sub.srv6_policy.clone() else {
+            return Err(CliError::Custom("No policy selected".into()));
+        };
+        if let Some(d) = c.eng.net.device_mut(c.dev) {
+            if let DeviceState::Router(rs) = &mut d.state {
+                if let Some(p) = rs.srv6.policies.iter_mut().find(|p| p.name == name) {
+                    p.segments = sids;
+                }
+            }
+        }
+        Ok(String::new())
+    }
+
+    /// `srv6 route <prefix> policy POL1`：业务前缀引用 Policy（外层目的 = Policy 端点）。
+    pub fn srv6_route_policy(c: &mut Ctx) -> Result<String, CliError> {
+        let (dst, len) = ipv6_prefix_arg(c, "prefix")?;
+        let name = c.word("policy");
+        if name.is_empty() {
+            return Err(CliError::Custom("Policy name is required".into()));
+        }
+        if let Some(d) = c.eng.net.device_mut(c.dev) {
+            if let DeviceState::Router(rs) = &mut d.state {
+                let Some(endpoint) = rs
+                    .srv6
+                    .policies
+                    .iter()
+                    .find(|p| p.name == name)
+                    .map(|p| p.endpoint)
+                else {
+                    return Err(CliError::Custom(format!("Policy {} not found", name)));
+                };
+                rs.srv6.routes.retain(|r| !(r.dst == dst && r.len == len));
+                rs.srv6.routes.push(sim_core::device::Srv6Route {
+                    dst,
+                    len,
+                    sid: endpoint,
+                    policy: Some(name),
+                });
             }
         }
         Ok(String::new())
@@ -5620,6 +5714,7 @@ pub fn prompt(eng: &Engine, sess: &Session, dev: DevId) -> String {
                 Some(v) => format!("{}(config-vlan{})#", d.name, v),
                 None => format!("{}(config-vlan)#", d.name),
             },
+            Mode::Srv6Policy => format!("{}(config-srv6-policy)#", d.name),
             // IOS 不会进入 tmsh 模块；保留可识别兜底。
             Mode::TmosLtm | Mode::TmosSys => format!("{}>", d.name),
         },
@@ -5726,6 +5821,11 @@ pub fn prompt(eng: &Engine, sess: &Session, dev: DevId) -> String {
                 Some(v) => format!("[{}-vlan{}]", d.name, v),
                 None => format!("[{}]", d.name),
             },
+            Mode::Srv6Policy => format!(
+                "[{}-srv6-policy-{}]",
+                d.name,
+                sess.sub.srv6_policy.clone().unwrap_or_default()
+            ),
             Mode::TmosLtm | Mode::TmosSys => format!("[{}]", d.name),
             // 阶段 6B：ZBF 子模式不属于 VRP/Comware；保持可识别兜底，不冒充其提示符。
             Mode::ClassMap | Mode::PolicyMap | Mode::PolicyMapClass => {

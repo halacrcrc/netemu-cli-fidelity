@@ -132,15 +132,29 @@ pub struct Route6 {
     pub src: RouteSrc,
 }
 
-/// SRv6 静态路由：目的前缀 → 远端 SID（BE）。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// SRv6 静态路由：目的前缀 → 远端 SID（BE）或经 SRv6 Policy 引导。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Srv6Route {
     pub dst: Ipv6Addr,
     pub len: u8,
     pub sid: Ipv6Addr,
+    /// 引用的 Policy 名（None = BE 直达远端 SID）。
+    #[serde(default)]
+    pub policy: Option<String>,
 }
 
-/// SRv6 配置（BE 简化：locator + 本地 SID + 静态路由）。
+/// SRv6 Policy（教学简化：color + end-point + 段列表）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Srv6Policy {
+    pub name: String,
+    pub color: u32,
+    /// Policy 的端点（通常为远端 PE 的 SID/地址）。
+    pub endpoint: Ipv6Addr,
+    /// 段列表：按遍历顺序 [第一段, ..., 最终段]。
+    pub segments: Vec<Ipv6Addr>,
+}
+
+/// SRv6 配置（BE + Policy 简化：locator + 本地 SID + 静态路由/Policy）。
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Srv6Config {
     #[serde(default)]
@@ -149,6 +163,8 @@ pub struct Srv6Config {
     pub sids: Vec<Ipv6Addr>,
     #[serde(default)]
     pub routes: Vec<Srv6Route>,
+    #[serde(default)]
+    pub policies: Vec<Srv6Policy>,
 }
 
 /// 等 NDP 解析后发送的 IPv6 报文。

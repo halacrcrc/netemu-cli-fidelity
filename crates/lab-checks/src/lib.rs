@@ -152,6 +152,12 @@ pub enum CheckKind {
     Ospfv3Neighbors { dev: DevId, min: usize },
     /// 检查 SRv6 静态路由。
     Srv6Route { dev: DevId, dst: Ipv6Addr, len: u8 },
+    /// 检查 SRv6 Policy（名称与端点匹配）。
+    Srv6Policy {
+        dev: DevId,
+        name: String,
+        endpoint: Ipv6Addr,
+    },
     /// 发起 IPv6 ping 并检查结果。
     Ping6 {
         from: DevId,
@@ -833,6 +839,28 @@ fn eval_read_only(eng: &Engine, kind: &CheckKind) -> Option<(bool, String)> {
                     format!("SRv6 路由 {}/{} 存在", sim_packets::ipv6_str(dst), len)
                 } else {
                     format!("SRv6 路由 {}/{} 缺失", sim_packets::ipv6_str(dst), len)
+                },
+            )
+        }
+        CheckKind::Srv6Policy {
+            dev,
+            name,
+            endpoint,
+        } => {
+            let found = eng.net.device(*dev).is_some_and(|d| {
+                matches!(&d.state, sim_core::device::DeviceState::Router(rs)
+                    if rs.srv6.policies.iter().any(|p| p.name == *name && p.endpoint == *endpoint && !p.segments.is_empty()))
+            });
+            (
+                found,
+                if found {
+                    format!(
+                        "SRv6 Policy {}（端点 {}，段列表已配置）",
+                        name,
+                        sim_packets::ipv6_str(endpoint)
+                    )
+                } else {
+                    format!("SRv6 Policy {} 未配置或段列表为空", name)
                 },
             )
         }

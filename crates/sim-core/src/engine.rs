@@ -619,7 +619,11 @@ impl Engine {
         }
         // 0d. EVPN：VTEP 控制面；Underlay 路由器按外层单播转发
         if let L3::Evpn(e) = frame.payload {
-            if !self.encap_fwd_over_underlay(dev_id, in_port, e.dst, DEFAULT_TTL, L3::Evpn(e)) {
+            let fwd = EvpnPacket {
+                ttl: e.ttl.saturating_sub(1),
+                ..e
+            };
+            if !self.encap_fwd_over_underlay(dev_id, in_port, e.dst, e.ttl, L3::Evpn(fwd)) {
                 self.evpn_on_packet(dev_id, e);
             }
             return;
@@ -3297,6 +3301,7 @@ impl Engine {
                     vtep_ip: local,
                     vni: *vni,
                     vlan: *vlan,
+                    ttl: 64,
                 };
                 let frame = EthernetFrame {
                     dst: BROADCAST_MAC,
@@ -4726,8 +4731,12 @@ impl Engine {
             let Some((u, du)) = next else { break };
             done.insert(u);
             let Some(lsa) = rt.lsdb.get(&u) else { continue };
-            for i in 0..lsa.neighbor_count as usize {
-                let v = lsa.neighbors[i];
+            for v in lsa
+                .neighbors
+                .iter()
+                .take(lsa.neighbor_count as usize)
+                .copied()
+            {
                 if v == [0; 6] || !rt.lsdb.contains_key(&v) {
                     continue;
                 }
@@ -4766,8 +4775,7 @@ impl Engine {
             let Some(lsa) = rt.lsdb.get(sid) else {
                 continue;
             };
-            for i in 0..lsa.link_count as usize {
-                let Some(link) = lsa.links[i] else { continue };
+            for link in lsa.links.iter().take(lsa.link_count as usize).flatten() {
                 if connected.contains(&(link.net, link.len)) || !seen.insert((link.net, link.len)) {
                     continue;
                 }
@@ -5192,8 +5200,12 @@ impl Engine {
             let Some((u, du)) = next else { break };
             done.insert(u);
             let Some(lsa) = rt.lsdb.get(&u) else { continue };
-            for i in 0..lsa.neighbor_count as usize {
-                let v = lsa.neighbors[i];
+            for v in lsa
+                .neighbors
+                .iter()
+                .take(lsa.neighbor_count as usize)
+                .copied()
+            {
                 if v == 0 || !rt.lsdb.contains_key(&v) {
                     continue;
                 }
@@ -5233,8 +5245,7 @@ impl Engine {
             let Some(lsa) = rt.lsdb.get(rid) else {
                 continue;
             };
-            for i in 0..lsa.link_count as usize {
-                let Some(link) = lsa.links[i] else { continue };
+            for link in lsa.links.iter().take(lsa.link_count as usize).flatten() {
                 if connected.contains(&(link.net, link.len)) || !seen.insert((link.net, link.len)) {
                     continue;
                 }
@@ -5427,10 +5438,13 @@ impl Engine {
             return;
         }
         let mut prefixes = Vec::new();
-        for i in 0..pkt.count.min(8) as usize {
-            if let Some((ip, len)) = pkt.prefixes[i] {
-                prefixes.push((ip, len));
-            }
+        for (ip, len) in pkt
+            .prefixes
+            .iter()
+            .take(pkt.count.min(8) as usize)
+            .filter_map(|e| *e)
+        {
+            prefixes.push((ip, len));
         }
         let rt = self.ospfv3.entry(dev).or_default();
         rt.neighbors.insert(
@@ -5586,7 +5600,15 @@ impl Engine {
             s.sent += 1;
             (s.target, s.sent)
         };
-        if let Some((port, arp_for, src)) = self.route_for_ping6(dev, target) {
+        let Some((port, arp_for, src)) = self.route_for_ping6(dev, target) else {
+            // 无路由：标记会话完成并吐出，避免会话泄漏挂起
+            if let Some(s) = self.ping6_session_mut(dev, sid) {
+                s.done = true;
+                s.reported = true;
+            }
+            return;
+        };
+        {
             let pkt = Ipv6Packet {
                 src,
                 dst: target,
@@ -5896,7 +5918,7 @@ impl Engine {
 
     // ---------- SRv6 BE（教学用 IPv6-in-IPv6） ----------
 
-    fn srv6_route_for(&self, dev: DevId, dst: Ipv6Addr) -> Option<Ipv6Addr> {
+    fn srv6_route_for(&self, dev: DevId, dst: Ipv6Addr) -> Option<&crate::device::Srv6Route> {
         let d = self.net.device(dev)?;
         let DeviceState::Router(rs) = &d.state else {
             return None;
@@ -5906,7 +5928,6 @@ impl Engine {
             .iter()
             .filter(|r| ipv6_in_prefix(&dst, &r.dst, r.len))
             .max_by_key(|r| r.len)
-            .map(|r| r.sid)
     }
 
     fn srv6_source(&self, dev: DevId) -> Option<Ipv6Addr> {
@@ -5921,18 +5942,48 @@ impl Engine {
     }
 
     fn srv6_encapsulate(&mut self, dev: DevId, pkt: Ipv6Packet) -> bool {
-        let Some(sid) = self.srv6_route_for(dev, pkt.dst) else {
+        let Some(route) = self.srv6_route_for(dev, pkt.dst).cloned() else {
             return false;
         };
         let Some(src) = self.srv6_source(dev) else {
             return false;
         };
-        let outer = Srv6Packet {
+        // Policy 引用：压入段列表，外层目的 = 第一段。
+        // BE（无 policy）：段列表为空，外层目的 = 远端 SID。
+        // 内部约定：segments[i] = 第 i+1 个待处理段（SRH 段列表的正序存储）。
+        let policy_segs: Vec<Ipv6Addr> = route
+            .policy
+            .as_ref()
+            .and_then(|name| {
+                self.net.device(dev).and_then(|d| match &d.state {
+                    DeviceState::Router(rs) => rs
+                        .srv6
+                        .policies
+                        .iter()
+                        .find(|p| &p.name == name)
+                        .map(|p| p.segments.clone()),
+                    _ => None,
+                })
+            })
+            .unwrap_or_default();
+        let mut outer = Srv6Packet {
             src,
-            dst: sid,
+            dst: route.sid,
             hop_limit: 64,
+            segments: [None; 3],
+            segments_left: 0,
             inner: pkt,
         };
+        if let Some(first) = policy_segs.first() {
+            // SRH 教学约定：外层目的 = 第一段；slots 是队列（slots[0] = 下一个待处理段），
+            // End 节点处理完当前段后左移一格。
+            outer.dst = *first;
+            let rest = policy_segs.len().saturating_sub(1).min(3);
+            for (i, sid) in policy_segs.iter().skip(1).take(rest).enumerate() {
+                outer.segments[i] = Some(*sid);
+            }
+            outer.segments_left = rest as u8;
+        }
         self.send_srv6_outer(dev, outer);
         true
     }
@@ -5981,6 +6032,27 @@ impl Engine {
             }
         };
         if local {
+            // SRH End 行为：仍有未处理段 → 取下一段作为新目的并继续逐跳转发。
+            // 内部约定：segments[i] 按遍历顺序存段；segments_left = 尚未处理的段数，
+            // 下一段 = segments[pkt.segments.len() - segments_left]。
+            if pkt.segments_left > 0 {
+                // 队列语义：slots[0] = 下一个待处理段；处理后左移一格。
+                let Some(next) = pkt.segments[0] else {
+                    self.dropped += 1;
+                    return;
+                };
+                let mut fwd = pkt;
+                fwd.dst = next;
+                fwd.segments = [pkt.segments[1], pkt.segments[2], None];
+                fwd.segments_left -= 1;
+                if fwd.hop_limit <= 1 {
+                    self.dropped += 1;
+                    return;
+                }
+                self.send_srv6_outer(dev, fwd);
+                return;
+            }
+            // 段列表耗尽（End.DT6）：解封装并按内层 IPv6 转发/交付。
             let frame = EthernetFrame {
                 dst: BROADCAST_MAC,
                 src: BROADCAST_MAC,

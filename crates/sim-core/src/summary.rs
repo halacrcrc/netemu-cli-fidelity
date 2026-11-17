@@ -206,6 +206,8 @@ pub struct DevSummary {
     #[serde(default)]
     pub srv6_sids: Vec<String>,
     #[serde(default)]
+    pub srv6_policies: Vec<Srv6PolicySummary>,
+    #[serde(default)]
     pub srv6_routes: Vec<Srv6RouteSummary>,
 }
 
@@ -214,6 +216,16 @@ pub struct Srv6RouteSummary {
     pub dst: String,
     pub len: u8,
     pub sid: String,
+    #[serde(default)]
+    pub policy: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Srv6PolicySummary {
+    pub name: String,
+    pub color: u32,
+    pub endpoint: String,
+    pub segments: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1068,6 +1080,21 @@ impl Net {
                                 dst: sim_packets::ipv6_str(&r.dst),
                                 len: r.len,
                                 sid: sim_packets::ipv6_str(&r.sid),
+                                policy: r.policy.clone(),
+                            })
+                            .collect(),
+                        _ => vec![],
+                    },
+                    srv6_policies: match &d.state {
+                        DeviceState::Router(rs) => rs
+                            .srv6
+                            .policies
+                            .iter()
+                            .map(|p| Srv6PolicySummary {
+                                name: p.name.clone(),
+                                color: p.color,
+                                endpoint: sim_packets::ipv6_str(&p.endpoint),
+                                segments: p.segments.iter().map(sim_packets::ipv6_str).collect(),
                             })
                             .collect(),
                         _ => vec![],
@@ -1214,6 +1241,23 @@ impl Net {
                                 dst: sim_packets::ipv6_from_str(&r.dst)?,
                                 len: r.len.min(128),
                                 sid: sim_packets::ipv6_from_str(&r.sid)?,
+                                policy: r.policy.clone(),
+                            })
+                        })
+                        .collect();
+                    rs.srv6.policies = ds
+                        .srv6_policies
+                        .iter()
+                        .filter_map(|p| {
+                            Some(Srv6Policy {
+                                name: p.name.clone(),
+                                color: p.color,
+                                endpoint: sim_packets::ipv6_from_str(&p.endpoint)?,
+                                segments: p
+                                    .segments
+                                    .iter()
+                                    .filter_map(|s| sim_packets::ipv6_from_str(s))
+                                    .collect(),
                             })
                         })
                         .collect();

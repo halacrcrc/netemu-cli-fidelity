@@ -577,6 +577,8 @@ pub fn build() -> Trees {
         security_rule: vec![],
         ipsec: vec![],
         ospfv3: vec![],
+        // F5 TMOS 无 SRv6 Policy 视图。
+        srv6_policy: vec![],
         vlan: vec![],
         // 阶段 6B：ZBF 子模式只存在于 IOS XE 树。
         class_map: vec![],

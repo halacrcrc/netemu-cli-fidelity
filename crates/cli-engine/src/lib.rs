@@ -180,6 +180,8 @@ pub struct SubCtx {
     pub pmap: Option<String>,
     /// 阶段 6B：ZBF policy-map class 视图中的类名（含 `class-default`）。
     pub pmap_class: Option<String>,
+    /// SRv6 Policy 视图中正在编辑的策略名
+    pub srv6_policy: Option<String>,
 }
 
 /// 远程登录输入流程。
@@ -264,6 +266,8 @@ pub enum Mode {
     SecurityPolicy,
     /// 安全策略规则视图
     SecurityRule,
+    /// SRv6 Policy 视图
+    Srv6Policy,
     /// IPsec 隧道视图
     Ipsec,
     /// OSPFv3 进程视图
@@ -304,6 +308,7 @@ impl Mode {
             Mode::SecurityPolicy => "security_policy",
             Mode::SecurityRule => "security_rule",
             Mode::Ipsec => "ipsec",
+            Mode::Srv6Policy => "srv6_policy",
             Mode::Ospfv3 => "ospfv3",
             Mode::Vlan => "vlan",
             Mode::ClassMap => "class_map",

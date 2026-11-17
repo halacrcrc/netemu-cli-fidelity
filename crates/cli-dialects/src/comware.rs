@@ -1356,5 +1356,7 @@ pub fn build() -> Trees {
             CNode::lit("quit", "Quit from the current view").run(h_quit),
             CNode::lit("return", "Return to the user view").run(h_return),
         ],
+        // SRv6 Policy 视图：Comware 侧暂无 `srv6 policy` 进入命令，保留空视图兜底。
+        srv6_policy: vec![],
     }
 }

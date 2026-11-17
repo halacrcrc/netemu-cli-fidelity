@@ -51,6 +51,7 @@ fn h_quit(c: &mut Ctx) -> Result<String, CliError> {
         | Mode::Vlan
         | Mode::ClassMap
         | Mode::PolicyMap
+        | Mode::Srv6Policy
         | Mode::PolicyMapClass => Mode::Config,
         _ => Mode::Exec,
     };
@@ -481,6 +482,7 @@ pub fn build() -> Trees {
                     CNode::lit("table", "Clear the session table").run(cmd::reset_security_session),
                 ),
             )),
+            CNode::lit("quit", "Quit to the user view").run(h_quit),
         ]
         .into_iter()
         .chain(login_cmds())
@@ -505,13 +507,37 @@ pub fn build() -> Trees {
                     CNode::lit("sid", "Local SID")
                         .kid(CNode::param(ParamKind::Word, "sid", "IPv6 SID").run(cmd::srv6_sid)),
                 )
-                .kid(CNode::lit("route", "Static SRv6 route").kid(
-                    CNode::param(ParamKind::Word, "prefix", "Destination /64").kid(
-                        CNode::lit("sid", "Remote SID").kid(
-                            CNode::param(ParamKind::Word, "sid", "IPv6 SID").run(cmd::srv6_route),
+                .kid(
+                    CNode::lit("route", "Static SRv6 route").kid(
+                        CNode::param(ParamKind::Word, "prefix", "Destination /64")
+                            .kid(
+                                CNode::lit("sid", "Remote SID").kid(
+                                    CNode::param(ParamKind::Word, "sid", "IPv6 SID")
+                                        .run(cmd::srv6_route),
+                                ),
+                            )
+                            .kid(
+                                CNode::lit("policy", "Reference an SRv6 Policy").kid(
+                                    CNode::param(ParamKind::Word, "policy", "Policy name")
+                                        .run(cmd::srv6_route_policy),
+                                ),
+                            ),
+                    ),
+                )
+                .kid(
+                    CNode::lit("policy", "SRv6 Policy").kid(
+                        CNode::param(ParamKind::Word, "name", "Policy name").kid(
+                            CNode::lit("color", "Color").kid(
+                                CNode::param(ParamKind::Number, "color", "Color value").kid(
+                                    CNode::lit("end-point", "Policy end point").kid(
+                                        CNode::param(ParamKind::Word, "endpoint", "IPv6 end point")
+                                            .run(cmd::srv6_policy_enter),
+                                    ),
+                                ),
+                            ),
                         ),
                     ),
-                )),
+                ),
             CNode::lit("bgp", "BGP process")
                 .kid(CNode::param(ParamKind::Number, "asn", "Local AS number").run(cmd::bgp_enter)),
             CNode::lit("security-policy", "Security policy")
@@ -1311,6 +1337,14 @@ pub fn build() -> Trees {
                             .run(cmd::security_rule_delete),
                     ),
                 ),
+            ),
+            CNode::lit("quit", "Quit from the current view").run(h_quit),
+            CNode::lit("return", "Return to the user view").run(h_return),
+        ],
+        srv6_policy: vec![
+            CNode::lit("segment-list", "Segment list in traversal order").kid(
+                CNode::param(ParamKind::WordList, "segments", "SIDs in traversal order")
+                    .run(cmd::srv6_policy_segment_list),
             ),
             CNode::lit("quit", "Quit from the current view").run(h_quit),
             CNode::lit("return", "Return to the user view").run(h_return),

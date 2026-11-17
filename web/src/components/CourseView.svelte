@@ -11,7 +11,7 @@
   } from '../content/cmdmap';
   import { renderMarkdown } from '../lib/md';
   import { getSim, inspectCommand, type InspectionResult } from '../lib/sim';
-  import { app } from '../lib/store.svelte';
+  import { setViewName } from '../lib/store.svelte';
   import { LABS, labTitle } from '../lib/labs';
 
   let currentId = $state(LESSONS[0]?.id ?? '');
@@ -126,8 +126,11 @@
 
   function openLab() {
     if (!current?.lab) return;
-    app.view = 'lab';
-    window.dispatchEvent(new CustomEvent('netemu:open-lab', { detail: current.lab }));
+    setViewName('lab');
+    // LeftPanel 在 lab 视图挂载后 $effect 才注册监听——宏任务派发确保 Svelte flush 完成
+    setTimeout(() => {
+      window.dispatchEvent(new CustomEvent('netemu:open-lab', { detail: current.lab }));
+    }, 0);
   }
 </script>
 

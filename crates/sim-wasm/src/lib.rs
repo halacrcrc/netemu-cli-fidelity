@@ -1079,6 +1079,29 @@ impl Sim {
         Ok(serde_json::json!({ "passed": r[0].passed, "detail": r[0].detail }).to_string())
     }
 
+    /// SRv6 Policy 判分。
+    pub fn check_srv6_policy(
+        &mut self,
+        dev: u32,
+        name: &str,
+        endpoint: &str,
+    ) -> Result<String, JsValue> {
+        let ep = sim_packets::ipv6_from_str(endpoint)
+            .ok_or_else(|| JsValue::from_str("invalid IPv6 address"))?;
+        let r = lab_checks::run_checks(
+            &mut self.eng,
+            &[lab_checks::Check {
+                label: String::new(),
+                kind: lab_checks::CheckKind::Srv6Policy {
+                    dev,
+                    name: name.to_string(),
+                    endpoint: ep,
+                },
+            }],
+        );
+        Ok(serde_json::json!({ "passed": r[0].passed, "detail": r[0].detail }).to_string())
+    }
+
     /// IPv6 ping 探测。
     pub fn check_ping6(&mut self, from: u32, to: &str) -> Result<String, JsValue> {
         let to = sim_packets::ipv6_from_str(to)

@@ -50,6 +50,7 @@ export interface LabCheckDef {
     | { type: 'muxRole'; dev: string; port: number; role: 'principal' | 'separate' | 'group'; group?: number }
     | { type: 'ospfv3Neighbors'; dev: string; min: number }
     | { type: 'srv6Route'; dev: string; dst: string }
+    | { type: 'srv6Policy'; dev: string; name: string; endpoint: string }
     | { type: 'ping6'; from: string; to: string; expect?: boolean }
     | {
         type: 'securityPolicy';
@@ -1290,49 +1291,53 @@ export const lab21: LabDef = {
 
 export const lab22: LabDef = {
   id: 'srv6-be',
-  title: '实验二十二 · SRv6 BE 跨网段转发',
+  title: '实验二十二 · SRv6 BE 与 Policy 流量引导',
   brief:
-    'PE1—P—PE2 三台路由器组成 IPv6 骨干（Underlay），两端各接业务网段。PE 上配置 Locator 与本地 SID，把去往对端业务网段的报文封装到远端 SID，报文逐跳穿过骨干，出口 PE 解封装后交付。注意中间的 P 只跑普通 IPv6 转发——不配任何 SRv6，这正是 SRv6 BE 的精髓。',
+    'PE1—P1—PE2 与 PE1—P2—PE2 构成菱形双路径的 IPv6 骨干，两端各接业务网段。先用 SRv6 BE（单段远端 SID）打通业务；再用 SRv6 Policy（color + end-point + 段列表）把 PE1 去往业务网段的流量引导到经过 P2 的路径——SRH 段列表在 P2 上逐段处理（End），最终在 PE2 解封装（End.DT6）。抓包选 PE1—P2 链路可看到 Policy 路径的封装报文。',
   tasks: [
-    '接口地址（全部 undo shutdown）：PE1 g0/0/0 2001:db8:1::1/64、g0/0/1 2001:db8:12::1/64；P g0/0/0 2001:db8:12::2/64、g0/0/1 2001:db8:23::1/64；PE2 g0/0/0 2001:db8:23::2/64、g0/0/1 2001:db8:2::1/64',
-    'PE1：srv6 locator 2001:db8:100::/64；srv6 sid 2001:db8:100::1。PE2：srv6 locator 2001:db8:200::/64；srv6 sid 2001:db8:200::1',
-    'SRv6 路由：PE1 srv6 route 2001:db8:2::/64 sid 2001:db8:200::1；PE2 srv6 route 2001:db8:1::/64 sid 2001:db8:100::1',
-    'Underlay 静态路由（模拟 IGP 全网贯通）：PE1 ipv6 route-static 2001:db8:200:: 64 2001:db8:12::2 与 2001:db8:23:: 64 2001:db8:12::2；P 2001:db8:200:: 64 2001:db8:23::2 与 2001:db8:100:: 64 2001:db8:12::1；PE2 ipv6 route-static 2001:db8:100:: 64 2001:db8:23::1 与 2001:db8:12:: 64 2001:db8:23::1',
-    'P 上不要配置任何 srv6 命令——它只做 IPv6 转发。选中 PE1—P 链路抓包，能看到封装后的 SRv6 报文逐跳前进',
-    'display srv6 应看到 Locator、本地 SID 与路由；PC1 ping6 2001:db8:2::10 应通',
+    '接口地址（全部 undo shutdown）：PE1 g0/0/0 2001:db8:1::1/64、g0/0/1 2001:db8:12::1/64（P1）、g0/0/2 2001:db8:14::1/64（P2）；P1 g0/0/0 2001:db8:12::2/64、g0/0/1 2001:db8:23::1/64；P2 g0/0/0 2001:db8:14::2/64、g0/0/1 2001:db8:24::1/64；PE2 g0/0/0 2001:db8:23::2/64、g0/0/1 2001:db8:24::2/64、g0/0/2 2001:db8:2::1/64',
+    'Locator/SID：PE1 srv6 locator 2001:db8:100::/64 + srv6 sid 2001:db8:100::1；PE2 srv6 locator 2001:db8:200::/64 + srv6 sid 2001:db8:200::1；P2 srv6 locator 2001:db8:400::/64 + srv6 sid 2001:db8:400::2（Policy 中间段需要 End 处理）',
+    'Underlay 路由（全部 ipv6 route-static）：PE1 → 400::/64 via 2001:db8:14::2、200::/64 via 2001:db8:12::2；P1 → 200::/64 via 2001:db8:23::2、100::/64 via 2001:db8:12::1；P2 → 200::/64 via 2001:db8:24::2、100::/64 via 2001:db8:14::1；PE2 → 400::/64 via 2001:db8:24::1、100::/64 via 2001:db8:23::2',
+    'SRv6 BE：PE1 srv6 route 2001:db8:2::/64 sid 2001:db8:200::1；PE2 srv6 route 2001:db8:1::/64 sid 2001:db8:100::1',
+    'SRv6 Policy（PE1）：srv6 policy POL1 color 100 end-point 2001:db8:200::1 → segment-list 2001:db8:400::2 2001:db8:200::1（第一段经 P2 的 End，最终段为 PE2）→ quit；再 srv6 route 2001:db8:2::/64 policy POL1',
+    '验证：从 PE1 ping ipv6 2001:db8:400::2 应通（P2 的 SID 可达）；PC1 ping6 2001:db8:2::10 应通——流量按 Policy 走 PE1→P2→PE2；抓包 PE1—P2 链路能看到 Policy 封装报文',
   ],
   checks: [
-    { label: 'PE1 配置去往业务网段的 SRv6 路由', kind: { type: 'srv6Route', dev: 'PE1', dst: '2001:db8:2::/64' } },
-    { label: 'PE2 配置回程 SRv6 路由', kind: { type: 'srv6Route', dev: 'PE2', dst: '2001:db8:1::/64' } },
-    { label: 'Underlay IPv6 贯通（PE1 → P）', kind: { type: 'ping6', from: 'PE1', to: '2001:db8:23::1' } },
-    { label: 'PC1 → PC2 经 SRv6 穿过骨干连通', kind: { type: 'ping6', from: 'PC1', to: '2001:db8:2::10' } },
+    { label: 'PE1 配置 SRv6 Policy POL1（端点 = PE2 的 SID）', kind: { type: 'srv6Policy', dev: 'PE1', name: 'POL1', endpoint: '2001:db8:200::1' } },
+    { label: 'PE1 业务前缀引用 Policy', kind: { type: 'srv6Route', dev: 'PE1', dst: '2001:db8:2::/64' } },
+    { label: 'PE2 配置回程 BE 路由', kind: { type: 'srv6Route', dev: 'PE2', dst: '2001:db8:1::/64' } },
+    { label: 'Underlay 贯通（PE1 → P2 的 SID）', kind: { type: 'ping6', from: 'PE1', to: '2001:db8:400::2' } },
+    { label: 'PC1 → PC2 经 SRv6 Policy 路径连通', kind: { type: 'ping6', from: 'PC1', to: '2001:db8:2::10' } },
   ],
   build: (sim) => {
     const pc1 = sim.add_device('Host', 'Ios');
     const pe1 = sim.add_device('Router', 'Vrp');
-    const p = sim.add_device('Router', 'Vrp');
+    const p1 = sim.add_device('Router', 'Vrp');
+    const p2 = sim.add_device('Router', 'Vrp');
     const pe2 = sim.add_device('Router', 'Vrp');
     const pc2 = sim.add_device('Host', 'Ios');
     sim.rename_device(pc1, 'PC1');
     sim.rename_device(pe1, 'PE1');
-    sim.rename_device(p, 'P');
+    sim.rename_device(p1, 'P1');
+    sim.rename_device(p2, 'P2');
     sim.rename_device(pe2, 'PE2');
     sim.rename_device(pc2, 'PC2');
-    sim.add_link(pc1, pe1);
-    sim.add_link(pe1, p);
-    sim.add_link(p, pe2);
-    sim.add_link(pe2, pc2);
+    sim.add_link(pc1, pe1); // PE1 p0
+    sim.add_link(pe1, p1); // PE1 p1 / P1 p0
+    sim.add_link(p1, pe2); // P1 p1 / PE2 p0
+    sim.add_link(pe1, p2); // PE1 p2 / P2 p0
+    sim.add_link(p2, pe2); // P2 p1 / PE2 p1
+    sim.add_link(pe2, pc2); // PE2 p2
     sim.set_host_v6(pc1, '2001:db8:1::10', 64, '2001:db8:1::1');
     sim.set_host_v6(pc2, '2001:db8:2::10', 64, '2001:db8:2::1');
-    setPosition(pc1, { x: 40, y: 120 });
-    setPosition(pe1, { x: 230, y: 120 });
-    setPosition(p, { x: 430, y: 60 });
-    setPosition(pe2, { x: 630, y: 120 });
-    setPosition(pc2, { x: 820, y: 120 });
+    setPosition(pc1, { x: 40, y: 130 });
+    setPosition(pe1, { x: 210, y: 130 });
+    setPosition(p1, { x: 400, y: 50 });
+    setPosition(p2, { x: 400, y: 210 });
+    setPosition(pe2, { x: 590, y: 130 });
+    setPosition(pc2, { x: 770, y: 130 });
   },
 };
-
-// ---------- 实验二十三：数据中心综合（M-LAG 双归 + VXLAN Underlay + F5 应用交付） ----------
 
 export const lab23: LabDef = {
   id: 'dc-comprehensive',
@@ -1341,7 +1346,7 @@ export const lab23: LabDef = {
     '把 M8 的数据中心技术串成一个 Spine-Leaf 组网：接入交换机 SW1 用 LACP 双归到 DSW1/DSW2 组成的 M-LAG 对，两台 M-LAG 成员作为 VTEP 与另一侧的 DSW3 跨过 SPINE 路由器（IPv4 Underlay）建 VXLAN 隧道，业务 VLAN10 二层延伸到服务器侧；F5 LTM 对外提供 VIP，把应用流量轮询交付给两台真实服务器。一台应用服务器到 VIP 的 TCP 连接要穿过 M-LAG 双归、VXLAN 封装、Underlay 路由与 LTM 转换四层机制。',
   tasks: [
     '接入层：SW1 vlan batch 10 → stp disable（M-LAG 双归不依赖 STP）；APP1/APP2 的接入口 access VLAN10',
-    'SW1 双归：interface eth-trunk 1 → mode lacp-static → G0/0/2（接 DSW1）、G0/0/3（接 DSW2）分别 eth-trunk 1，两口 trunk allow-pass vlan 10',
+    'SW1 双归：interface eth-trunk 1 → mode lacp-static → G0/0/3（接 DSW1）、G0/0/4（接 DSW2）分别 eth-trunk 1，两口 trunk allow-pass vlan 10',
     'M-LAG 对：DSW1/DSW2 vlan batch 10 → mlag domain 1 → 互连接口（peer-link）trunk allow-pass vlan 10 并 mlag peer-link',
     'M-LAG 对上联：DSW1/DSW2 的 eth-trunk 1（G0/0/1）trunk allow-pass vlan 10，双归口同时转发',
     'Underlay：DSW1 vlan 100 → vlanif100 10.0.0.1/24 接 SPINE G0/0/0 10.0.0.2/24；DSW2 vlan 100 → vlanif100 10.0.1.2/24 接 SPINE G0/0/1 10.0.1.1/24；DSW3 vlan 100 → vlanif100 10.0.2.2/24 接 SPINE G0/0/2 10.0.2.1/24（均 undo shutdown）',
