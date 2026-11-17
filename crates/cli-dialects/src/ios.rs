@@ -966,22 +966,14 @@ pub fn build() -> Trees {
                                 CNode::lit("inspect", "Inspect type class map")
                                     .kid(
                                         CNode::lit("match-any", "Match any criterion").kid(
-                                            CNode::param(
-                                                ParamKind::Word,
-                                                "name",
-                                                "Class map name",
-                                            )
-                                            .run(cmd::zbf_no_class_map),
+                                            CNode::param(ParamKind::Word, "name", "Class map name")
+                                                .run(cmd::zbf_no_class_map),
                                         ),
                                     )
                                     .kid(
                                         CNode::lit("match-all", "Match all criteria").kid(
-                                            CNode::param(
-                                                ParamKind::Word,
-                                                "name",
-                                                "Class map name",
-                                            )
-                                            .run(cmd::zbf_no_class_map),
+                                            CNode::param(ParamKind::Word, "name", "Class map name")
+                                                .run(cmd::zbf_no_class_map),
                                         ),
                                     ),
                             ),
@@ -1623,22 +1615,21 @@ pub fn build() -> Trees {
                             .run(cmd::zbf_recognized_only),
                     ),
                 ),
-            CNode::lit("no", "Negate a command or set its defaults")
-                .kid(
-                    CNode::lit("match", "Negate match criteria")
-                        .kid(
-                            CNode::lit("protocol", "Match a protocol").kid(
-                                CNode::param(ParamKind::Word, "proto", "Protocol name")
-                                    .run(cmd::zbf_cmap_no_match_protocol),
-                            ),
-                        )
-                        .kid(
-                            CNode::lit("access-group", "Match an access list").kid(
-                                CNode::param(ParamKind::Number, "acl", "Access list number")
-                                    .run(cmd::zbf_cmap_no_match_access_group),
-                            ),
+            CNode::lit("no", "Negate a command or set its defaults").kid(
+                CNode::lit("match", "Negate match criteria")
+                    .kid(
+                        CNode::lit("protocol", "Match a protocol").kid(
+                            CNode::param(ParamKind::Word, "proto", "Protocol name")
+                                .run(cmd::zbf_cmap_no_match_protocol),
                         ),
-                ),
+                    )
+                    .kid(
+                        CNode::lit("access-group", "Match an access list").kid(
+                            CNode::param(ParamKind::Number, "acl", "Access list number")
+                                .run(cmd::zbf_cmap_no_match_access_group),
+                        ),
+                    ),
+            ),
             CNode::lit("exit", "Exit from class-map mode").run(h_exit),
             CNode::lit("end", "Exit to privileged mode").run(h_end),
         ],
@@ -1679,9 +1670,11 @@ pub fn build() -> Trees {
         policy_map_class: vec![
             CNode::lit("inspect", "Enable stateful inspection")
                 .run(cmd::zbf_action_inspect)
-                .kid(
-                    CNode::opt_param(ParamKind::Word, "param", "Parameter map name"),
-                ),
+                .kid(CNode::opt_param(
+                    ParamKind::Word,
+                    "param",
+                    "Parameter map name",
+                )),
             CNode::lit("pass", "Allow without inspection").run(cmd::zbf_action_pass),
             CNode::lit("drop", "Drop matched traffic")
                 .run(cmd::zbf_action_drop)

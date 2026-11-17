@@ -159,8 +159,8 @@ pub mod cmd {
     use sim_core::device::{
         Acl, AclProto, AclRule, BgpPeerPolicy, IpsecTunnel, LtmMember, LtmPool, LtmVirtual,
         MlagConfig, RoutePolicy, RoutePolicyNode, SecurityPolicy, SecurityZone, StackConfig,
-        WlanProfile, WlanSecurity, ZbfAction, ZbfClassMap, ZbfMatch, ZbfMatchType,
-        ZbfPolicyClass, ZbfPolicyMap, ZbfZonePair,
+        WlanProfile, WlanSecurity, ZbfAction, ZbfClassMap, ZbfMatch, ZbfMatchType, ZbfPolicyClass,
+        ZbfPolicyMap, ZbfZonePair,
     };
     use sim_packets::mask_from_prefix;
 
@@ -3248,8 +3248,7 @@ pub mod cmd {
             return Ok(());
         }
         let profile = profile_mod::profile_for(c.dialect, kind);
-        if profile.capability(profile_mod::Capability::ZoneFirewall)
-            == CapabilityVerdict::Supported
+        if profile.capability(profile_mod::Capability::ZoneFirewall) == CapabilityVerdict::Supported
         {
             Ok(())
         } else {
@@ -3477,7 +3476,8 @@ pub mod cmd {
         if let Some(d) = c.eng.net.device_mut(c.dev) {
             if let DeviceState::Router(rs) = &mut d.state {
                 if let Some(cm) = rs.zbf_class_maps.iter_mut().find(|m| m.name == cmap) {
-                    cm.matches.retain(|m| m != &ZbfMatch::Protocol(proto.clone()));
+                    cm.matches
+                        .retain(|m| m != &ZbfMatch::Protocol(proto.clone()));
                 }
             }
         }
@@ -3529,10 +3529,11 @@ pub mod cmd {
         }
         if let Some(d) = c.eng.net.device_mut(c.dev) {
             if let DeviceState::Router(rs) = &mut d.state {
-                let in_use = rs
-                    .zbf_policy_maps
-                    .iter()
-                    .any(|p| p.classes.iter().any(|cl| !cl.is_default && cl.class_name == name));
+                let in_use = rs.zbf_policy_maps.iter().any(|p| {
+                    p.classes
+                        .iter()
+                        .any(|cl| !cl.is_default && cl.class_name == name)
+                });
                 if in_use {
                     return Err(CliError::Custom(
                         "Class map is referenced by a policy map".into(),
@@ -3590,9 +3591,7 @@ pub mod cmd {
         if !is_default {
             let exists = match &c.eng.net.device(c.dev) {
                 Some(d) => match &d.state {
-                    DeviceState::Router(rs) => {
-                        rs.zbf_class_maps.iter().any(|m| m.name == name)
-                    }
+                    DeviceState::Router(rs) => rs.zbf_class_maps.iter().any(|m| m.name == name),
                     _ => false,
                 },
                 None => false,
@@ -3826,10 +3825,14 @@ pub mod cmd {
             ));
         }
         if !zbf_zone_exists(c, &src) {
-            return Err(CliError::Custom(format!("Security zone {src} does not exist")));
+            return Err(CliError::Custom(format!(
+                "Security zone {src} does not exist"
+            )));
         }
         if !zbf_zone_exists(c, &dst) {
-            return Err(CliError::Custom(format!("Security zone {dst} does not exist")));
+            return Err(CliError::Custom(format!(
+                "Security zone {dst} does not exist"
+            )));
         }
         if let Some(d) = c.eng.net.device_mut(c.dev) {
             if let DeviceState::Router(rs) = &mut d.state {
@@ -3985,13 +3988,23 @@ pub mod cmd {
     pub fn show_zbf_policy_map(c: &mut Ctx) -> Result<String, CliError> {
         require_firewall(c)?;
         let name = c.word("zp");
-        Ok(show::zbf_policy_map(c.eng, c.dev, (!name.is_empty()).then_some(name.as_str()), false))
+        Ok(show::zbf_policy_map(
+            c.eng,
+            c.dev,
+            (!name.is_empty()).then_some(name.as_str()),
+            false,
+        ))
     }
 
     pub fn show_zbf_policy_map_session(c: &mut Ctx) -> Result<String, CliError> {
         require_firewall(c)?;
         let name = c.word("zp");
-        Ok(show::zbf_policy_map(c.eng, c.dev, (!name.is_empty()).then_some(name.as_str()), true))
+        Ok(show::zbf_policy_map(
+            c.eng,
+            c.dev,
+            (!name.is_empty()).then_some(name.as_str()),
+            true,
+        ))
     }
 
     /// `security-policy` / Comware `security-policy ip`：进入安全策略视图。

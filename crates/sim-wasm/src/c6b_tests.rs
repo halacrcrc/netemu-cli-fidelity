@@ -386,8 +386,14 @@ fn c6b_lab6_active_scoring_is_four_of_four_and_reacts_to_breakage() {
     );
     // 英文只提供 checkLabels：数量必须与 CN 的 4 个判分项一一对应。
     let en_labels = block_after(LABS_EN, EN_MARKER, "checkLabels: [");
-    let en_count = en_labels.lines().filter(|l| l.trim().starts_with('\'')).count();
-    assert_eq!(en_count, 4, "英文 checkLabels 必须与 4 个判分项对应: {en_labels}");
+    let en_count = en_labels
+        .lines()
+        .filter(|l| l.trim().starts_with('\''))
+        .count();
+    assert_eq!(
+        en_count, 4,
+        "英文 checkLabels 必须与 4 个判分项对应: {en_labels}"
+    );
 
     let (mut sim, pc, r1) = lab6_sim();
     let _ = run_course(&mut sim, pc, r1);
@@ -423,10 +429,7 @@ fn c6b_lab6_active_scoring_is_four_of_four_and_reacts_to_breakage() {
     exec_ok(&mut sim, r1, "transport input ssh");
     to_priv(&mut sim, r1, "R1#");
     let restored = judge(&mut sim);
-    assert!(
-        restored.iter().all(|r| r["passed"] == true),
-        "{restored:?}"
-    );
+    assert!(restored.iter().all(|r| r["passed"] == true), "{restored:?}");
 
     // 破坏 2：对端接口 shutdown（数据面接地）→ SSH 登录项必须失败，其余保持。
     exec_ok(&mut sim, r1, "configure terminal");

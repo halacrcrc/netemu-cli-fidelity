@@ -231,7 +231,11 @@ fn lab6_course() -> Vec<Task> {
     );
     for (i, t) in cn_parsed.iter().enumerate() {
         assert!(!t.steps.is_empty(), "第 {i} 条任务解析不出步骤: {}", cn[i]);
-        assert!(!t.dev.is_empty(), "第 {i} 条任务缺少执行设备标签: {}", cn[i]);
+        assert!(
+            !t.dev.is_empty(),
+            "第 {i} 条任务缺少执行设备标签: {}",
+            cn[i]
+        );
     }
     cn_parsed
 }
@@ -319,22 +323,22 @@ fn c6b_lab6_course_original_sequence_runs_on_real_engine() {
     assert_eq!(
         prompts,
         vec![
-            "R1#",             // enable
-            "R1(config)#",     // configure terminal
-            "R1(config-if)#",  // interface g0/0
-            "R1(config-if)#",  // ip address ...
-            "R1(config-if)#",  // no shutdown
-            "R1(config)#",     // exit
-            "R1(config)#",     // username ...
+            "R1#",              // enable
+            "R1(config)#",      // configure terminal
+            "R1(config-if)#",   // interface g0/0
+            "R1(config-if)#",   // ip address ...
+            "R1(config-if)#",   // no shutdown
+            "R1(config)#",      // exit
+            "R1(config)#",      // username ...
             "R1(config-line)#", // line vty 0 4
             "R1(config-line)#", // login local
             "R1(config-line)#", // transport input ssh
-            "R1(config)#",     // exit
-            "Username: ",      // ssh 192.168.1.1（用户名提示）
-            "R1#",             // 口令通过 → 远端特权提示符
-            "R1#",             // show ip interface brief（远端执行）
-            "PC1>",            // exit 断开
-            "PC1>",            // telnet 被拒
+            "R1(config)#",      // exit
+            "Username: ",       // ssh 192.168.1.1（用户名提示）
+            "R1#",              // 口令通过 → 远端特权提示符
+            "R1#",              // show ip interface brief（远端执行）
+            "PC1>",             // exit 断开
+            "PC1>",             // telnet 被拒
         ],
         "提示符链必须与课程原文一致"
     );
@@ -418,10 +422,7 @@ fn c6b_lesson47_states_capture_and_show_ssh_boundaries() {
         LESSON47.contains("登录也是数据面流量"),
         "讲义必须把登录与数据面可达性绑在一起"
     );
-    assert!(
-        LESSON47.contains("self"),
-        "讲义必须保留 self 区域例外说明"
-    );
+    assert!(LESSON47.contains("self"), "讲义必须保留 self 区域例外说明");
     // 讲义与实验六的绑定关系不变。
     assert!(LESSON47.contains("lab: mgmt-ssh"), "讲义必须仍绑定实验六");
 }

@@ -63,7 +63,13 @@ fn ios_mgmt(eng: &mut Engine, dev: u32) {
         eng,
         &mut s,
         dev,
-        &["line vty 0 4", "login local", "transport input ssh", "exit", "exit"],
+        &[
+            "line vty 0 4",
+            "login local",
+            "transport input ssh",
+            "exit",
+            "exit",
+        ],
     );
 }
 
@@ -111,7 +117,10 @@ fn assert_refused(out: &str, p: &str, ctx: &str) {
         "{ctx}: 应报网络不可达: {out:?}"
     );
     assert_eq!(p, "PC1>", "{ctx}: 被拒绝后应回到本机提示符");
-    assert!(!out.contains("[netemu]"), "{ctx}: 模拟器提示不得混入设备输出");
+    assert!(
+        !out.contains("[netemu]"),
+        "{ctx}: 模拟器提示不得混入设备输出"
+    );
     assert!(!out.contains("% Invalid"), "{ctx}: 不得退化成语法错误");
 }
 
@@ -228,7 +237,12 @@ fn c6b_self_management_traffic_ignores_zone_pair_drop() {
         fw,
         &["ip address 192.168.1.1 255.255.255.0", "no shutdown"],
     );
-    run(&mut eng, &mut s, fw, &["zone-member security INSIDE", "exit"]);
+    run(
+        &mut eng,
+        &mut s,
+        fw,
+        &["zone-member security INSIDE", "exit"],
+    );
     run(
         &mut eng,
         &mut s,
@@ -299,7 +313,12 @@ fn c6b_forwarded_login_follows_zone_based_policy() {
         fw,
         &["ip address 192.168.1.1 255.255.255.0", "no shutdown"],
     );
-    run(&mut eng, &mut s, fw, &["zone-member security INSIDE", "exit"]);
+    run(
+        &mut eng,
+        &mut s,
+        fw,
+        &["zone-member security INSIDE", "exit"],
+    );
     run(&mut eng, &mut s, fw, &["interface g0/1"]);
     run(
         &mut eng,
@@ -307,7 +326,12 @@ fn c6b_forwarded_login_follows_zone_based_policy() {
         fw,
         &["ip address 203.0.113.1 255.255.255.0", "no shutdown"],
     );
-    run(&mut eng, &mut s, fw, &["zone-member security OUTSIDE", "exit"]);
+    run(
+        &mut eng,
+        &mut s,
+        fw,
+        &["zone-member security OUTSIDE", "exit"],
+    );
     run(
         &mut eng,
         &mut s,
@@ -339,7 +363,10 @@ fn c6b_forwarded_login_follows_zone_based_policy() {
     ios_mgmt(&mut eng, r1);
 
     let (out, last, p) = ssh_attempt(&mut eng, pc, "203.0.113.10");
-    assert!(out.contains("Trying"), "ZBF inspect permit 时应进入登录流程: {out:?}");
+    assert!(
+        out.contains("Trying"),
+        "ZBF inspect permit 时应进入登录流程: {out:?}"
+    );
     assert_eq!(last, "");
     assert_eq!(p, "R1#");
 
