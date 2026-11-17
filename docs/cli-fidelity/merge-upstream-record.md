@@ -19,7 +19,7 @@
 | 测试 | **355 passed / 0 failed / 53 个测试二进制**（基线 349 / 52，差值见 §4） |
 | 门禁 | clippy / test / wasm / tsc / vite build 全绿；fmt 逐文件抽查（§4.3） |
 | 浏览器 | 真实 Chrome + 本次构建，Lab 6 全流程 4/4、讲义 08 ZBF 简流程会话 1 条、实验二十二 SRv6 Policy 子视图可进；控制台 0 错误 |
-| 推送 | `git push origin main` **在本机网络上失败**（`Failed to connect to github.com:443`，多次重试一致，见 §8.1）；本地 `main` 已含合并提交，网络可用时执行同一条命令即可（**不推 `upstream`**） |
+| 推送 | `git push origin main` 已成功（`16f10a7..490c0bf`）；直连 443 被阻断，经用户提供的本地代理 `127.0.0.1:10808` 完成，过程见 §8.1（**不推 `upstream`**） |
 
 ---
 
@@ -182,19 +182,22 @@
 - 合并改动：**29 个文件变更**（+1148 / −129），其中新增文件 1 个（`crates/cli-dialects/tests/srv6_policy_golden.rs`），本记录与 2 张截图为后续新增。
 - 合并后 `git status`：无 `UU`/未解决冲突（`git diff --check` 空、冲突标记 grep 空）。
 - 分支历史：`main` 保留两侧提交 + 一个合并提交 `fdcfbe4`（父 `16f10a7` + `58e22e9`；不 rebase、不改写任一侧提交）。
-- 推送：`git push origin main` → **失败（环境网络问题，非仓库问题）**，详见 §8.1。本地 `main` 已就绪：`origin/main..main` 共 7 个提交（合并提交 + 记录提交 + 对方 5 个提交）。
+- 推送：`git push origin main` → **成功**，`16f10a7..490c0bf  main -> main`；远端 `refs/heads/main = 490c0bf` 已回读核对，`git status -sb` 显示 `## main...origin/main`（无 ahead/behind）。
 - **明确未做**：未推送 `upstream`；未新增功能；未删测、未放宽断言；未改写给定提交。
 
-### 8.1 推送失败的真实记录
+### 8.1 推送过程（直连失败 → 本地代理成功）
 
-| 时间/尝试 | 命令 | 结果 |
+| 顺序 | 命令 | 结果 |
 |---|---|---|
-| 第 1 次 | `git push origin main` | `OpenSSL SSL_read: unexpected eof while reading` |
-| 第 2 次 | `git push origin main` | `Recv failure: Connection was reset` |
-| 第 3 次 | `git -c http.version=HTTP/1.1 push origin main` | `Failed to connect to github.com:443 after 21039 ms` |
-| 第 4~6 次（间隔 8s / 10s / 直接重试） | `git push origin main` | 同「connect 超时」，`git ls-remote origin` 亦同样失败 |
+| 1 | `git push origin main` | `OpenSSL SSL_read: unexpected eof while reading` |
+| 2 | `git push origin main` | `Recv failure: Connection was reset` |
+| 3 | `git -c http.version=HTTP/1.1 push origin main` | `Failed to connect to github.com:443 after 21039 ms` |
+| 4~6 | 间隔 8s / 10s 直连重试、`git ls-remote origin` | 同「connect 超时」 |
+| 7 | `curl -x http://127.0.0.1:10808 https://github.com/` / `--socks5-hostname` | 均 `200`（代理可用） |
+| 8 | `git -c http.proxy=http://127.0.0.1:10808 -c https.proxy=http://127.0.0.1:10808 push origin main` | ✅ `16f10a7..490c0bf  main -> main` |
 
-归因：`Resolve-DnsName github.com` 解析到 `20.6.7.17`，TCP 443 握手超时；本机无 HTTP(S)_PROXY / WinHTTP 代理，与仓库凭据、远端仓库状态无关。
-网络可用时执行：`git push origin main`（**不要** `git push upstream`）。
+归因：直连 `github.com:443`（解析 `20.6.7.17`）握手超时，属本机网络出口限制，与仓库凭据/远端状态无关；用户提供本地代理 `127.0.0.1:10808` 后一次成功。
+代理只以**单命令 `-c` 参数**传入，未写入 `.gitconfig`、未改动任何 git 配置。
+后续若需再次推送且直连仍不通：`git -c http.proxy=http://127.0.0.1:10808 push origin main`（**不要** `git push upstream`）。
 
 > 公开仓库收平（把 `main` rebase/merge 回推到 `upstream`）是用户决策项，不在本包范围内。
