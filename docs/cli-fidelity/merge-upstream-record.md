@@ -5,7 +5,8 @@
 - 合并对象：`upstream/main`（`58e22e9`，公开仓库 `github.com/halacrcrc/netemu`）→ `main`（`16f10a7`，私有仓库 `origin`）
 - 合并基线：`3d784e0`
 - 方式：`git merge upstream/main`（普通合并提交，不 rebase；两侧提交已各自公开）
-- 本记录随合并提交一并入库；合并提交号见 `git log --oneline -1`（下方 §8 亦给出）
+- 合并提交：`fdcfbe4`，父提交 `16f10a7`（我方）+ `58e22e9`（对方）
+- 本记录随该合并提交一并入库
 
 ---
 
@@ -180,7 +181,7 @@
 
 - 合并改动：**29 个文件变更**（+1148 / −129），其中新增文件 1 个（`crates/cli-dialects/tests/srv6_policy_golden.rs`），本记录与 2 张截图为后续新增。
 - 合并后 `git status`：无 `UU`/未解决冲突（`git diff --check` 空、冲突标记 grep 空）。
-- 分支历史：`main` 保留两侧提交 + 一个合并提交（不 rebase、不改写任一侧提交）。
+- 分支历史：`main` 保留两侧提交 + 一个合并提交 `fdcfbe4`（父 `16f10a7` + `58e22e9`；不 rebase、不改写任一侧提交）。
 - 推送：`git push origin main` → 成功（`origin` = 私有仓库 `netemu-cli-fidelity`）。
 - **明确未做**：未推送 `upstream`；未新增功能；未删测、未放宽断言；未改写给定提交。
 
