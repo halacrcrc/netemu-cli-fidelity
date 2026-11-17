@@ -11,7 +11,7 @@ use sim_core::device::{
 };
 use sim_core::engine::Engine;
 use sim_core::{port_mac, Device};
-use sim_packets::{ipv4_str, ipv6_str, mask_from_prefix};
+use sim_packets::{ipv4_str, ipv6_str, mask_from_prefix, Ipv4Addr};
 
 use crate::ifname;
 
@@ -68,6 +68,8 @@ pub fn int_brief(eng: &Engine, dev: DevId, dialect: Dialect) -> String {
     };
     let mut out = String::new();
     match dialect {
+        // TMOS 首批不含 net interface 摘要（tmsh 树无该命令），不沿用华为系输出。
+        Dialect::Tmos => {}
         Dialect::Ios => {
             out.push_str(&format!(
                 "{:<26}{:<15}{:<4}{:<7}{:<22}{}\n",
@@ -292,6 +294,7 @@ pub fn route_table_vrf(eng: &Engine, dev: DevId, dialect: Dialect, vrf: u16) -> 
 fn render_route_rows(rows: &[RouteRow], dialect: Dialect) -> String {
     let mut out = String::new();
     match dialect {
+        Dialect::Tmos => {}
         Dialect::Ios => {
             out.push_str("Codes: C - connected, S - static\n\n");
             out.push_str("Gateway of last resort is not set\n\n");
@@ -406,6 +409,8 @@ pub fn render_ping(dialect: Dialect, s: &PingSession) -> String {
     let sent = s.total;
     let recv = s.received();
     match dialect {
+        // TMOS 首批不含 ICMP echo 命令；中性统计文本，不沿用华为/IOS 逐字格式。
+        Dialect::Tmos => format!("PING {}: {} transmitted, {} received", target, sent, recv),
         Dialect::Ios => {
             let mut out = format!(
                 "Type escape sequence to abort.\nSending {}, 100-byte ICMP Echos to {}, timeout is 2 seconds:\n",
@@ -897,6 +902,10 @@ pub fn render_ping6(dialect: Dialect, s: &sim_core::device::Ping6Session) -> Str
         (s.received as f64 / s.sent as f64 * 100.0) as u64
     };
     match dialect {
+        Dialect::Tmos => format!(
+            "PING6 {}: {} transmitted, {} received",
+            target, s.sent, s.received
+        ),
         Dialect::Ios => format!(
             "Sending {}, 100-byte ICMPv6 Echos to {}\nSuccess rate is {} percent ({}/{})",
             s.sent, target, rate, s.received, s.sent
@@ -938,6 +947,71 @@ pub fn render_ping6_generic(s: &sim_core::device::Ping6Session) -> String {
         "PING6 {}: 56 data bytes\n{} packets transmitted, {} received, {:.0}% packet loss",
         target, s.sent, s.received, loss
     )
+}
+
+/// Stage 2B / C3：`show ip dhcp binding` — 从真实服务器租约与地址池渲染。
+/// 无带版本设备样本，只做字段/结构断言，不写逐字输出黄金。
+pub fn dhcp_binding_table(eng: &Engine, dev: DevId, dialect: Dialect) -> String {
+    let Some(d) = eng.net.device(dev) else {
+        return String::new();
+    };
+    let DeviceState::Router(rs) = &d.state else {
+        return String::new();
+    };
+    let mut leases: Vec<(Mac, Ipv4Addr)> = rs.dhcp_leases.iter().map(|l| (l.mac, l.ip)).collect();
+    leases.sort_by_key(|x| x.1);
+    let mut out = String::new();
+    match dialect {
+        Dialect::Ios => {
+            out.push_str("Bindings from all pools not associated with VRF:\n");
+            out.push_str(&format!(
+                "{:<20}{:<18}{:<10}{}\n",
+                "IP address", "Client-ID/Hardware address", "Lease expiration", "Type"
+            ));
+            for (mac, ip) in &leases {
+                out.push_str(&format!(
+                    "{:<20}{:<18}{:<10}{}\n",
+                    ipv4_str(*ip),
+                    sim_packets::mac_str_cisco(mac),
+                    "Automatic",
+                    "Automatic"
+                ));
+            }
+            for p in &rs.dhcp_pools {
+                out.push_str(&format!(
+                    "Pool {} : net {}/{} gateway {} dns {}\n",
+                    p.name,
+                    ipv4_str(p.network),
+                    p.prefix,
+                    ipv4_str(p.gateway),
+                    ipv4_str(p.dns)
+                ));
+            }
+            out.push_str(&format!("Excluded ranges: {}\n", rs.dhcp_excluded.len()));
+        }
+        _ => {
+            out.push_str("IP address       Client-ID/Hardware address   Type\n");
+            for (mac, ip) in &leases {
+                out.push_str(&format!(
+                    "{:<17}{:<28}{}\n",
+                    ipv4_str(*ip),
+                    sim_packets::mac_str_cisco(mac),
+                    "Dynamic"
+                ));
+            }
+            for p in &rs.dhcp_pools {
+                out.push_str(&format!(
+                    "Pool {} : net {}/{} gateway-list {} dns-list {}\n",
+                    p.name,
+                    ipv4_str(p.network),
+                    p.prefix,
+                    ipv4_str(p.gateway),
+                    ipv4_str(p.dns)
+                ));
+            }
+        }
+    }
+    out.trim_end().to_string()
 }
 
 /// `show ip dhcp snooping binding` / `display dhcp snooping user-binding`。
@@ -1658,20 +1732,32 @@ pub fn route_policies(eng: &Engine, dev: DevId, dialect: Dialect, only: Option<&
     out.trim_end().to_string()
 }
 
-/// `display firewall zone` / `display security-zone` / `show zone security`。
+/// `display firewall zone`（V6）/ `display security-zone`（Comware）/ `show zone security`。
+///
+/// 输出只消费唯一状态源（`RouterState::security_zones` + `Port::zone`），与配置
+/// 及会话状态保持一致；无带版本设备样本，因此只做结构断言、不建逐字黄金。
 pub fn security_zones(eng: &Engine, dev: DevId, dialect: Dialect) -> String {
     let Some(d) = eng.net.device(dev) else {
         return String::new();
     };
-    let DeviceState::Router(_) = &d.state else {
+    let DeviceState::Router(rs) = &d.state else {
         return String::new();
     };
-    let mut zones: Vec<(String, Vec<usize>)> = vec![];
+    // 区域集合 = 已创建区域 ∪ 端口引用的区域（兼容不写 security_zones 的旧存档）。
+    let mut zones: Vec<(String, Option<u8>, Vec<usize>)> = rs
+        .security_zones
+        .iter()
+        .map(|z| (z.name.clone(), z.effective_priority(), vec![]))
+        .collect();
     for p in &d.ports {
         let Some(z) = &p.zone else { continue };
-        match zones.iter_mut().find(|(n, _)| n == z) {
-            Some((_, ports)) => ports.push(p.idx),
-            None => zones.push((z.clone(), vec![p.idx])),
+        match zones.iter_mut().find(|(n, _, _)| n == z) {
+            Some((_, _, ports)) => ports.push(p.idx),
+            None => zones.push((
+                z.clone(),
+                sim_core::device::SecurityZone::default_priority(z),
+                vec![p.idx],
+            )),
         }
     }
     if zones.is_empty() {
@@ -1681,20 +1767,49 @@ pub fn security_zones(eng: &Engine, dev: DevId, dialect: Dialect) -> String {
         };
     }
     let mut out = String::new();
-    for (name, mut ports) in zones {
+    for (name, priority, mut ports) in zones {
         ports.sort_unstable();
-        out.push_str(&format!("Zone: {}\n", name));
-        for p in ports {
-            out.push_str(&format!(
-                "  Interface: {}\n",
-                ifname::display(dialect, d.kind, p)
-            ));
+        match dialect {
+            // IOS 教学抽象：沿用 Stage 3B 的 `zone` / `zone-member` 视图结构。
+            Dialect::Ios => {
+                out.push_str(&format!("Zone: {}\n", name));
+                for p in ports {
+                    out.push_str(&format!(
+                        "  Interface: {}\n",
+                        ifname::display(dialect, d.kind, p)
+                    ));
+                }
+            }
+            // VRP `display firewall zone`：区域优先 + 成员接口列表。
+            _ => {
+                match priority {
+                    Some(v) => out.push_str(&format!("{name} priority is {v}\n")),
+                    None => out.push_str(&format!("{name} priority is not configured\n")),
+                }
+                out.push_str(&format!(" interface of the zone is ({}):\n", ports.len()));
+                for p in ports {
+                    out.push_str(&format!("  {}\n", ifname::display(dialect, d.kind, p)));
+                }
+            }
         }
     }
     out.trim_end().to_string()
 }
 
-/// `display security-policy` / `show zone-pair security`。
+fn flow_state_label(s: sim_core::device::TcpFlowState) -> &'static str {
+    use sim_core::device::TcpFlowState as S;
+    match s {
+        S::SynSent => "syn_sent",
+        S::Established => "established",
+        S::FinWait => "fin_wait",
+        S::Closed => "closed",
+    }
+}
+
+/// `display security-policy`（V9）/ `show zone-pair security`（IOS 教学抽象）。
+///
+/// VRP 输出按官方示例的列结构（RULE ID / RULE NAME / STATE / ACTION / HITS），
+/// 并追加平台缺省策略行（V1/V9：`default`，any/any → deny）；不建逐字黄金。
 pub fn security_policies(eng: &Engine, dev: DevId, dialect: Dialect) -> String {
     let Some(d) = eng.net.device(dev) else {
         return String::new();
@@ -1702,15 +1817,12 @@ pub fn security_policies(eng: &Engine, dev: DevId, dialect: Dialect) -> String {
     let DeviceState::Router(rs) = &d.state else {
         return String::new();
     };
-    if rs.security_policies.is_empty() {
-        return match dialect {
-            Dialect::Ios => "No zone-pair configured.".into(),
-            _ => " Info: No security policy.\n".into(),
-        };
-    }
     let mut out = String::new();
     match dialect {
         Dialect::Ios => {
+            if rs.security_policies.is_empty() {
+                return "No zone-pair configured.".into();
+            }
             for p in &rs.security_policies {
                 out.push_str(&format!("Zone-pair: {}\n", p.name));
                 out.push_str(&format!("  source {}\n", p.src_zone));
@@ -1719,17 +1831,264 @@ pub fn security_policies(eng: &Engine, dev: DevId, dialect: Dialect) -> String {
                     "  action {}\n",
                     if p.permit { "permit" } else { "deny" }
                 ));
+                out.push_str(&format!(
+                    "  state {}\n",
+                    if p.enabled { "enable" } else { "disable" }
+                ));
             }
         }
         _ => {
-            out.push_str("Security-policy\n");
-            for p in &rs.security_policies {
-                out.push_str(&format!("  rule name {}\n", p.name));
-                out.push_str(&format!("    source-zone {}\n", p.src_zone));
-                out.push_str(&format!("    destination-zone {}\n", p.dst_zone));
+            out.push_str(&format!(
+                "{:<9}{:<16}{:<9}{:<8}{}\n",
+                "RULE ID", "RULE NAME", "STATE", "ACTION", "HITS"
+            ));
+            for (i, p) in rs.security_policies.iter().enumerate() {
                 out.push_str(&format!(
-                    "    action {}\n",
-                    if p.permit { "permit" } else { "deny" }
+                    "{:<9}{:<16}{:<9}{:<8}{}\n",
+                    i + 1,
+                    p.name,
+                    if p.enabled { "enable" } else { "disable" },
+                    if p.permit { "permit" } else { "deny" },
+                    p.hits
+                ));
+            }
+            // 平台缺省策略（不可删除）：未命中任何规则时按其动作处理。
+            out.push_str(&format!(
+                "{:<9}{:<16}{:<9}{:<8}{}\n",
+                "0", "default", "enable", "deny", 0
+            ));
+        }
+    }
+    out.trim_end().to_string()
+}
+
+/// `display security-policy rule name <n>`（V9）：单条规则明细。
+///
+/// 官方示例的字段形态为 `(<n> times matched) rule name <name>` + `source-zone` /
+/// `destination-zone` / `action`；无带版本设备样本，只做结构断言。
+pub fn security_policy_rule(eng: &Engine, dev: DevId, dialect: Dialect, name: &str) -> String {
+    let Some(d) = eng.net.device(dev) else {
+        return String::new();
+    };
+    let DeviceState::Router(rs) = &d.state else {
+        return String::new();
+    };
+    let Some(p) = rs.security_policies.iter().find(|p| p.name == name) else {
+        return match dialect {
+            Dialect::Ios => format!("No zone-pair {name} configured."),
+            _ => format!(" Info: The security policy rule {name} does not exist.\n"),
+        };
+    };
+    let mut out = format!("({} times matched) rule name {}\n", p.hits, p.name);
+    out.push_str(&format!("  source-zone {}\n", p.src_zone));
+    out.push_str(&format!("  destination-zone {}\n", p.dst_zone));
+    out.push_str(&format!(
+        "  action {}\n",
+        if p.permit { "permit" } else { "deny" }
+    ));
+    out.trim_end().to_string()
+}
+
+/// `show zone-pair security`（IOS XE 17.x ZBF）：真实 zone-pair 列表。
+///
+/// 官方正文证实 zone-pair 的方向与 `service-policy type inspect` 挂接；
+/// 无带版本设备样本，因此只做结构断言，不建立逐字输出黄金。
+pub fn zbf_zone_pairs(eng: &Engine, dev: DevId) -> String {
+    let Some(d) = eng.net.device(dev) else {
+        return String::new();
+    };
+    let DeviceState::Router(rs) = &d.state else {
+        return String::new();
+    };
+    if rs.zbf_zone_pairs.is_empty() {
+        return "No zone-pair configured.".into();
+    }
+    let mut out = String::new();
+    for z in &rs.zbf_zone_pairs {
+        out.push_str(&format!("Zone-pair: {}\n", z.name));
+        out.push_str(&format!("  source {}\n", z.src_zone));
+        out.push_str(&format!("  destination {}\n", z.dst_zone));
+        match &z.service_policy {
+            Some(p) => out.push_str(&format!("  service-policy inspect {p}\n")),
+            None => out.push_str("  service-policy inspect <none>\n"),
+        }
+    }
+    out.trim_end().to_string()
+}
+
+fn zbf_action_label(action: &sim_core::device::ZbfAction) -> String {
+    match action {
+        sim_core::device::ZbfAction::Inspect { parameter_map } => match parameter_map {
+            Some(p) => format!("inspect {p}"),
+            None => "inspect".into(),
+        },
+        sim_core::device::ZbfAction::Pass => "pass".into(),
+        sim_core::device::ZbfAction::Drop { log } => {
+            if *log {
+                "drop log".into()
+            } else {
+                "drop".into()
+            }
+        }
+    }
+}
+
+/// `show policy-map type inspect zone-pair [name] [session]`。
+///
+/// 结构对齐官方示例（`Zone-pair:` / `Service-policy inspect :` /
+/// `Class-map: ... (match-any)` / `Match: ...`），但计数是模拟器命中计数，
+/// 不伪造官方的 packets/bytes 逐字样本。
+pub fn zbf_policy_map(eng: &Engine, dev: DevId, only: Option<&str>, with_sessions: bool) -> String {
+    let Some(d) = eng.net.device(dev) else {
+        return String::new();
+    };
+    let DeviceState::Router(rs) = &d.state else {
+        return String::new();
+    };
+    let pairs: Vec<_> = rs
+        .zbf_zone_pairs
+        .iter()
+        .filter(|z| only.is_none_or(|n| z.name == n))
+        .collect();
+    if pairs.is_empty() {
+        return match only {
+            Some(n) => format!("No zone-pair {n} configured."),
+            None => "No zone-pair configured.".into(),
+        };
+    }
+    let mut out = String::new();
+    for z in pairs {
+        out.push_str(&format!("Zone-pair: {}\n", z.name));
+        let session_line = || {
+            format!(
+                "  sessions: {} icmp, {} tcp\n",
+                rs.security_sessions.len(),
+                rs.tcp_flows.len()
+            )
+        };
+        let Some(policy_name) = &z.service_policy else {
+            out.push_str(" Service-policy inspect : <none>\n");
+            if with_sessions {
+                out.push_str(&session_line());
+            }
+            continue;
+        };
+        out.push_str(&format!(" Service-policy inspect : {policy_name}\n"));
+        let Some(pm) = rs.zbf_policy_maps.iter().find(|p| &p.name == policy_name) else {
+            if with_sessions {
+                out.push_str(&session_line());
+            }
+            continue;
+        };
+        for cl in &pm.classes {
+            let kind = match cl.is_default {
+                true => "class-default".to_string(),
+                false => rs
+                    .zbf_class_maps
+                    .iter()
+                    .find(|c| c.name == cl.class_name)
+                    .map(|c| match c.match_type {
+                        sim_core::device::ZbfMatchType::Any => format!("{} (match-any)", c.name),
+                        sim_core::device::ZbfMatchType::All => format!("{} (match-all)", c.name),
+                    })
+                    .unwrap_or_else(|| cl.class_name.clone()),
+            };
+            out.push_str(&format!("Class-map: {kind}\n"));
+            if !cl.is_default {
+                if let Some(cm) = rs.zbf_class_maps.iter().find(|c| c.name == cl.class_name) {
+                    for m in &cm.matches {
+                        match m {
+                            sim_core::device::ZbfMatch::Protocol(p) => {
+                                out.push_str(&format!("  Match: protocol {p}\n"));
+                            }
+                            sim_core::device::ZbfMatch::AccessGroup(n) => {
+                                out.push_str(&format!("  Match: access-group {n}\n"));
+                            }
+                        }
+                    }
+                }
+            }
+            match &cl.action {
+                Some(a) => out.push_str(&format!("  {}\n", zbf_action_label(a))),
+                None if cl.is_default => out.push_str("  drop\n"),
+                None => out.push_str("  <no action>\n"),
+            }
+            out.push_str(&format!("  {} packets\n", cl.hits));
+        }
+        if with_sessions {
+            out.push_str(&format!(
+                "  sessions: {} icmp, {} tcp\n",
+                rs.security_sessions.len(),
+                rs.tcp_flows.len()
+            ));
+        }
+    }
+    out.trim_end().to_string()
+}
+
+/// `display firewall session table`（V3/V9）：会话表与真实状态一致。
+///
+/// 匹配键：ICMP = 源/目的 IP + echo id（双向）；TCP = 源/目的 IP + 端口（双向五元组）。
+pub fn security_sessions(eng: &Engine, dev: DevId, dialect: Dialect) -> String {
+    let Some(d) = eng.net.device(dev) else {
+        return String::new();
+    };
+    let DeviceState::Router(rs) = &d.state else {
+        return String::new();
+    };
+    if rs.security_sessions.is_empty() && rs.tcp_flows.is_empty() {
+        return match dialect {
+            Dialect::Ios => "No session established.".into(),
+            _ => " Info: No session table entry.\n".into(),
+        };
+    }
+    let mut out = String::new();
+    match dialect {
+        Dialect::Ios => {
+            out.push_str(&format!(
+                "{:<8}{:<22}{:<22}{}\n",
+                "Proto", "Source", "Destination", "State"
+            ));
+            for s in &rs.security_sessions {
+                out.push_str(&format!(
+                    "{:<8}{:<22}{:<22}{}\n",
+                    "icmp",
+                    ipv4_str(s.src),
+                    ipv4_str(s.dst),
+                    "-"
+                ));
+            }
+            for f in &rs.tcp_flows {
+                out.push_str(&format!(
+                    "{:<8}{:<22}{:<22}{}\n",
+                    "tcp",
+                    format!("{}:{}", ipv4_str(f.client), f.client_port),
+                    format!("{}:{}", ipv4_str(f.server), f.server_port),
+                    flow_state_label(f.state)
+                ));
+            }
+        }
+        _ => {
+            out.push_str(&format!(
+                " {:<10}{:<24}{:<24}{}\n",
+                "Protocol", "Source", "Destination", "State"
+            ));
+            for s in &rs.security_sessions {
+                out.push_str(&format!(
+                    " {:<10}{:<24}{:<24}{}\n",
+                    "icmp",
+                    ipv4_str(s.src),
+                    ipv4_str(s.dst),
+                    "-"
+                ));
+            }
+            for f in &rs.tcp_flows {
+                out.push_str(&format!(
+                    " {:<10}{:<24}{:<24}{}\n",
+                    "tcp",
+                    format!("{}:{}", ipv4_str(f.client), f.client_port),
+                    format!("{}:{}", ipv4_str(f.server), f.server_port),
+                    flow_state_label(f.state)
                 ));
             }
         }
@@ -2026,13 +2385,17 @@ pub fn ospf_neighbors(eng: &Engine, dev: DevId, dialect: Dialect) -> String {
     };
     let rid = ipv4_str(eng.ospf_router_id_of(dev));
     let nbs = eng.ospf_neighbors_of(dev);
+    let process = match &d.state {
+        DeviceState::Router(rs) => rs.ospf_process.unwrap_or(1),
+        _ => 1,
+    };
     let iface_for = |port: sim_core::device::PortId| ifname::display(dialect, d.kind, port);
     let mut out = String::new();
     match dialect {
         Dialect::Ios => {
             out.push_str(&format!(
-                "OSPF process 1, Router ID {}\n\n{:<16}{:<5}{:<16}{:<12}{:<16}{}\n",
-                rid, "Neighbor ID", "Pri", "State", "Dead Time", "Address", "Interface"
+                "OSPF process {}, Router ID {}\n\n{:<16}{:<5}{:<16}{:<12}{:<16}{}\n",
+                process, rid, "Neighbor ID", "Pri", "State", "Dead Time", "Address", "Interface"
             ));
             for (nrid, ip, port) in &nbs {
                 out.push_str(&format!(
@@ -2050,7 +2413,10 @@ pub fn ospf_neighbors(eng: &Engine, dev: DevId, dialect: Dialect) -> String {
             }
         }
         _ => {
-            out.push_str(&format!("OSPF Process 1 with Router ID {}\n", rid));
+            out.push_str(&format!(
+                "OSPF Process {} with Router ID {}\n",
+                process, rid
+            ));
             out.push_str(" Neighbors\n\n");
             out.push_str(&format!(
                 " {:<16}{:<18}{:<18}{}\n",
@@ -2118,10 +2484,12 @@ pub fn lag_table(eng: &Engine, dev: DevId, dialect: Dialect) -> String {
             Dialect::Ios => String::new(),
             Dialect::Vrp => "Info: No Eth-Trunk exists.".into(),
             Dialect::Comware => "Info: No aggregation group exists.".into(),
+            Dialect::Tmos => String::new(),
         };
     }
     let mut out = String::new();
     match dialect {
+        Dialect::Tmos => {}
         Dialect::Ios => {
             out.push_str("Flags:  D - down        P - bundled in port-channel\n");
             out.push_str("        U - in use      s - suspended\n\n");
@@ -2357,11 +2725,12 @@ pub fn acl_table(eng: &Engine, dev: DevId, dialect: Dialect) -> String {
                     let action = if r.permit { "permit" } else { "deny" };
                     let proto = match r.proto {
                         AclProto::Icmp => "icmp ",
+                        AclProto::Tcp => "tcp ",
                         AclProto::Any => "",
                     };
                     if (100..=199).contains(&acl.number) {
                         out.push_str(&format!(
-                            "    {} {}{} {} {}\n",
+                            "    {} {}{} {} {}{}\n",
                             action,
                             proto,
                             ipv4_str(r.src),
@@ -2370,7 +2739,8 @@ pub fn acl_table(eng: &Engine, dev: DevId, dialect: Dialect) -> String {
                                 "{} {}",
                                 ipv4_str(r.dst),
                                 mask_str_wildcard(r.dst_wildcard)
-                            )
+                            ),
+                            acl_ports_suffix(r.src_port, r.dst_port),
                         ));
                     } else {
                         out.push_str(&format!("    {} {}\n", action, ipv4_str(r.src)));
@@ -2389,6 +2759,7 @@ pub fn acl_table(eng: &Engine, dev: DevId, dialect: Dialect) -> String {
                     let action = if r.permit { "permit" } else { "deny" };
                     let proto = match r.proto {
                         AclProto::Icmp => " icmp",
+                        AclProto::Tcp => " tcp",
                         AclProto::Any => "",
                     };
                     let dst_part = if r.dst != 0 || r.dst_wildcard != 0 {
@@ -2401,12 +2772,13 @@ pub fn acl_table(eng: &Engine, dev: DevId, dialect: Dialect) -> String {
                         String::new()
                     };
                     out.push_str(&format!(
-                        " rule 5 {}{} source {} {}{}  (matched {})\n",
+                        " rule 5 {}{} source {} {}{}{}  (matched {})\n",
                         action,
                         proto,
                         ipv4_str(r.src),
                         ipv4_str(r.src_wildcard),
                         dst_part,
+                        acl_ports_suffix(r.src_port, r.dst_port),
                         r.hits
                     ));
                 }
@@ -2419,6 +2791,16 @@ pub fn acl_table(eng: &Engine, dev: DevId, dialect: Dialect) -> String {
 /// 通配符显示：0.0.0.0 → host 形式保留点分
 fn mask_str_wildcard(w: u32) -> String {
     ipv4_str(w)
+}
+
+/// Stage 2B / C5：TCP 端口约束渲染（`eq <port>`），无约束时为空。
+fn acl_ports_suffix(src_port: Option<u16>, dst_port: Option<u16>) -> String {
+    match (src_port, dst_port) {
+        (None, None) => String::new(),
+        (Some(s), None) => format!(" eq {}", s),
+        (None, Some(d)) => format!(" eq {}", d),
+        (Some(s), Some(d)) => format!(" eq {} eq {}", s, d),
+    }
 }
 
 /// `show ip nat translations` / `display nat session`（简化）。

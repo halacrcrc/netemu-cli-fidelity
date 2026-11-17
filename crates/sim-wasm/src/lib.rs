@@ -6,16 +6,84 @@ use std::collections::HashMap;
 
 use sim_core::device::{DeviceKind, DeviceState, Dialect};
 use sim_core::engine::{Engine, PING_HORIZON_NS};
+use sim_core::profile::{
+    self as profile_mod, LEGACY_PROFILE_NOTICE, LOAD_RESET_NOTICE, SCHEMA_VERSION,
+};
 use sim_core::summary::NetSummary;
 use sim_core::{DevId, Net};
 use sim_packets::ipv4_from_str;
 use wasm_bindgen::prelude::*;
 
+mod lab_defs;
+
+/// 阶段 5A：旧 F5 存档（LoadBalancer + 非 Tmos 方言）加载时对用户可见的提示。
+/// 抽象 `ltm` 命令已从 IOS/VRP/Comware 树移除，Pool/VS 状态按 sim-core 原样迁移，
+/// 但旧命令文本需要按真实 tmsh 重写；不允许静默改变实验判定。
+pub const F5_LEGACY_NOTICE: &str =
+    "旧 F5 存档已映射到独立的 TMOS 17.x / tmsh 方言；Pool 与 Virtual Server 状态已保留，但旧的抽象 ltm 命令不再可解析，请按课程原文改用真实 tmsh 命令";
+
+/// 存档加载报告：旧档映射与会话清空都必须对用户可见。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoadReport {
+    pub schema_version: u32,
+    pub legacy: bool,
+    pub mapped_profiles: usize,
+    pub notices: Vec<String>,
+}
+
 #[wasm_bindgen]
 pub struct Sim {
     eng: Engine,
     sessions: HashMap<DevId, cli_engine::Session>,
+    /// 设备会话令牌：设备会话级纯读检查必须携带真实的会话上下文。
+    session_ids: HashMap<DevId, String>,
+    next_session_seq: u64,
     kind_counts: HashMap<String, u32>,
+}
+
+fn mode_from(s: &str) -> Option<cli_engine::Mode> {
+    use cli_engine::Mode;
+    Some(match s {
+        "Exec" => Mode::Exec,
+        "Priv" => Mode::Priv,
+        "Config" => Mode::Config,
+        "If" => Mode::If,
+        "Pool" => Mode::Pool,
+        "Acl" => Mode::Acl,
+        "Line" => Mode::Line,
+        "Aaa" => Mode::Aaa,
+        "Mst" => Mode::Mst,
+        "Ospf" => Mode::Ospf,
+        "OspfArea" => Mode::OspfArea,
+        "Bgp" => Mode::Bgp,
+        "Isis" => Mode::Isis,
+        "RoutePolicy" => Mode::RoutePolicy,
+        "Zone" => Mode::Zone,
+        "SecurityPolicy" => Mode::SecurityPolicy,
+        "SecurityRule" => Mode::SecurityRule,
+        "ClassMap" => Mode::ClassMap,
+        "PolicyMap" => Mode::PolicyMap,
+        "PolicyMapClass" => Mode::PolicyMapClass,
+        "Ipsec" => Mode::Ipsec,
+        "Ospfv3" => Mode::Ospfv3,
+        "Vlan" => Mode::Vlan,
+        // 阶段 5A：tmsh 模块层级。
+        "TmosLtm" => Mode::TmosLtm,
+        "TmosSys" => Mode::TmosSys,
+        _ => return None,
+    })
+}
+
+fn inspection_json(i: &cli_engine::spec::Inspection) -> String {
+    serde_json::json!({
+        "passed": i.passed,
+        "detail": i.detail,
+        "status": i.status.label(),
+        "support": i.support.label(),
+        "evidence": i.evidence,
+        "specId": i.spec_id,
+    })
+    .to_string()
 }
 
 fn kind_from(s: &str) -> Option<DeviceKind> {
@@ -38,6 +106,8 @@ fn dialect_from(s: &str) -> Option<Dialect> {
         "Ios" | "ios" | "cisco" => Some(Dialect::Ios),
         "Vrp" | "vrp" | "huawei" => Some(Dialect::Vrp),
         "Comware" | "comware" | "h3c" => Some(Dialect::Comware),
+        // 阶段 5A：F5 BIG-IP TMOS 17.x / tmsh。
+        "Tmos" | "tmos" | "f5" | "F5" | "bigip" => Some(Dialect::Tmos),
         _ => None,
     }
 }
@@ -49,8 +119,113 @@ impl Sim {
         for id in ids {
             if self.eng.net.device(id).is_none() {
                 self.sessions.remove(&id);
+                self.session_ids.remove(&id);
             }
         }
+    }
+
+    /// 存档加载的纯逻辑入口（不经过 JsValue，便于原生测试）。
+    /// 保留"先在临时引擎构建，全部校验成功后再替换"的语义。
+    pub fn apply_summary_checked(&mut self, json: &str) -> Result<LoadReport, String> {
+        let mut summary: NetSummary =
+            serde_json::from_str(json).map_err(|e| format!("invalid topology: {e}"))?;
+        let legacy = summary.schema_version < SCHEMA_VERSION
+            || summary.devices.iter().any(|d| d.profile.is_none());
+        let mut mapped = 0usize;
+        let mut f5_migrated: Vec<(String, u32)> = Vec::new();
+        for d in &mut summary.devices {
+            // 阶段 5A：旧 F5 存档用 IOS/VRP/Comware 方言承载抽象 `ltm` 命令。
+            // 这里只改方言与 Profile，LTM 状态由 apply_summary 原样还原（唯一状态源），
+            // 并强制生成用户可见提示，避免静默改变实验判定。
+            if d.kind == DeviceKind::LoadBalancer && d.dialect != Dialect::Tmos {
+                d.dialect = Dialect::Tmos;
+                d.profile = Some(profile_mod::TMOS_LB_PROFILE.to_string());
+                f5_migrated.push((d.name.clone(), d.id));
+                mapped += 1;
+            }
+            if d.profile.is_none() {
+                d.profile = Some(profile_mod::profile_id_for(d.dialect, d.kind).to_string());
+                mapped += 1;
+            }
+        }
+        summary.schema_version = SCHEMA_VERSION;
+
+        let mut eng = Engine::new(Net::new());
+        eng.net.apply_summary(&summary)?;
+        eng.after_load();
+        self.eng = eng;
+        // 加载成功后清空所有终端会话与会话令牌，避免旧上下文进入新工作区。
+        self.sessions.clear();
+        self.session_ids.clear();
+        // 会话序号保持单调：加载/重置后重新签发的令牌不得与旧令牌相同，
+        // 否则已失效的旧令牌会重新生效。
+        self.kind_counts.clear();
+        for d in &self.eng.net.devices {
+            let base = match d.kind {
+                DeviceKind::Router => "Router",
+                DeviceKind::Switch => "Switch",
+                DeviceKind::Host => "PC",
+                DeviceKind::Firewall => "FW",
+                DeviceKind::AccessPoint => "AP",
+                DeviceKind::WlanController => "AC",
+                DeviceKind::LoadBalancer => "LB",
+            };
+            if let Some(sfx) = d.name.strip_prefix(base) {
+                if let Ok(n) = sfx.parse::<u32>() {
+                    let slot = self.kind_counts.entry(base.to_string()).or_insert(0);
+                    *slot = (*slot).max(n);
+                }
+            }
+        }
+        let mut notices = vec![LOAD_RESET_NOTICE.to_string()];
+        if legacy {
+            notices.push(LEGACY_PROFILE_NOTICE.to_string());
+            for d in &summary.devices {
+                if let Some(p) = &d.profile {
+                    notices.push(format!("设备 {}(id={}) → Profile {}", d.name, d.id, p));
+                }
+            }
+        }
+        // 阶段 5A：F5 迁移提示独立于 legacy 标记，任何旧 F5 档都必须可见。
+        if !f5_migrated.is_empty() {
+            notices.push(F5_LEGACY_NOTICE.to_string());
+            for (name, id) in &f5_migrated {
+                notices.push(format!(
+                    "旧 F5 设备 {}(id={}) → Dialect::Tmos / Profile {}",
+                    name,
+                    id,
+                    profile_mod::TMOS_LB_PROFILE
+                ));
+            }
+        }
+        Ok(LoadReport {
+            schema_version: SCHEMA_VERSION,
+            legacy,
+            mapped_profiles: mapped,
+            notices,
+        })
+    }
+
+    /// 设备会话级检查的纯逻辑入口（不经过 `JsValue`，便于原生契约测试）。
+    /// 会话令牌错误以明确字符串返回，不会被当成「设备不支持」的结构化结果。
+    pub fn verify_device_command_checked(
+        &self,
+        dev: u32,
+        session_id: &str,
+        line: &str,
+    ) -> Result<cli_engine::spec::Inspection, String> {
+        let Some(token) = self.session_ids.get(&dev) else {
+            return Err("no active device session".to_string());
+        };
+        if token != session_id {
+            return Err("session id mismatch".to_string());
+        }
+        let Some(sess) = self.sessions.get(&dev) else {
+            return Err("no active device session".to_string());
+        };
+        Ok(cli_dialects::inspect_device_command(
+            &self.eng, dev, sess, line,
+        ))
     }
 }
 
@@ -61,6 +236,8 @@ impl Sim {
         Sim {
             eng: Engine::new(Net::new()),
             sessions: HashMap::new(),
+            session_ids: HashMap::new(),
+            next_session_seq: 0,
             kind_counts: HashMap::new(),
         }
     }
@@ -109,6 +286,7 @@ impl Sim {
         };
         dev_ref.dialect = d;
         self.sessions.insert(dev, cli_engine::Session::default());
+        self.session_ids.remove(&dev);
         Ok(())
     }
 
@@ -192,6 +370,29 @@ impl Sim {
         Ok(())
     }
 
+    /// 阶段 5A：实验拓扑预配置设备物理口 IPv4 地址（属性面板语义）。
+    /// TMOS 的 `net self` / VLAN 对象不在首批范围，F5 实验用此 API 预置接口地址，
+    /// 与「PC 网关在属性面板填」同属拓扑预配置，不是 CLI 任务、不新建数据面。
+    pub fn set_port_ip(
+        &mut self,
+        dev: u32,
+        port: u32,
+        ip: &str,
+        prefix: u8,
+    ) -> Result<(), JsValue> {
+        let Some(d) = self.eng.net.device(dev) else {
+            return Err(JsValue::from_str("device not found"));
+        };
+        if d.kind == DeviceKind::Host {
+            return Err(JsValue::from_str("use set_host_config for hosts"));
+        }
+        let addr = ipv4_from_str(ip).ok_or_else(|| JsValue::from_str("invalid ip"))?;
+        self.eng
+            .net
+            .set_port_ip(dev, port as usize, Some(addr), prefix);
+        Ok(())
+    }
+
     /// 设置主机 IPv6 地址/前缀/网关（空串表示清除）。
     pub fn set_host_v6(&mut self, dev: u32, ip: &str, prefix: u8, gw: &str) -> Result<(), JsValue> {
         let Some(d) = self.eng.net.device(dev) else {
@@ -217,7 +418,27 @@ impl Sim {
         Ok(())
     }
 
-    /// 执行一行 CLI 并驱动引擎至静默，返回输出文本。
+    /// 执行一行 CLI 并返回结构化结果 JSON（设备文本与模拟器提示分通道）。
+    pub fn exec_command_result(&mut self, dev: u32, line: &str) -> Result<String, JsValue> {
+        if self.eng.net.device(dev).is_none() {
+            return Err(JsValue::from_str("device not found"));
+        }
+        self.sessions.entry(dev).or_default();
+        let Some(sess) = self.sessions.get_mut(&dev) else {
+            return Err(JsValue::from_str("device not found"));
+        };
+        let r = cli_dialects::exec_and_run_result(&mut self.eng, sess, dev, line);
+        Ok(serde_json::json!({
+            "status": r.status.label(),
+            "deviceOutput": r.device_output,
+            "simulatorNotices": r.simulator_notices,
+            "stateChanged": r.state_changed,
+        })
+        .to_string())
+    }
+
+    /// 迁移期文本契约：返回设备文本；模拟器提示以明确的 `[netemu]` 行单独附加，
+    /// 不伪装成厂商输出。前端应改用 `exec_command_result` 分通道各渲染一次。
     pub fn exec_command(&mut self, dev: u32, line: &str) -> Result<String, JsValue> {
         if self.eng.net.device(dev).is_none() {
             return Err(JsValue::from_str("device not found"));
@@ -226,7 +447,71 @@ impl Sim {
         let Some(sess) = self.sessions.get_mut(&dev) else {
             return Err(JsValue::from_str("device not found"));
         };
-        Ok(cli_dialects::exec_and_run(&mut self.eng, sess, dev, line))
+        let r = cli_dialects::exec_and_run_result(&mut self.eng, sess, dev, line);
+        let mut parts = vec![];
+        if !r.device_output.is_empty() {
+            parts.push(r.device_output);
+        }
+        for n in &r.simulator_notices {
+            parts.push(format!("[netemu] {}", n.trim_start_matches("[netemu] ")));
+        }
+        Ok(parts.join("\n"))
+    }
+
+    /// 设备会话令牌。加载/重置后旧令牌失效，避免旧上下文进入新工作区。
+    pub fn session_id(&mut self, dev: u32) -> Result<String, JsValue> {
+        if self.eng.net.device(dev).is_none() {
+            return Err(JsValue::from_str("device not found"));
+        }
+        self.sessions.entry(dev).or_default();
+        if let Some(id) = self.session_ids.get(&dev) {
+            return Ok(id.clone());
+        }
+        self.next_session_seq += 1;
+        let token = format!("dev{}-s{}", dev, self.next_session_seq);
+        self.session_ids.insert(dev, token.clone());
+        Ok(token)
+    }
+
+    /// Profile 级纯读命令检查（平台级结果，无设备实例）。mode 见 `verify_command`。
+    pub fn inspect_command(
+        &self,
+        profile_id: &str,
+        mode: &str,
+        line: &str,
+    ) -> Result<String, JsValue> {
+        let m = mode_from(mode).ok_or_else(|| JsValue::from_str("unknown mode"))?;
+        Ok(inspection_json(&cli_dialects::inspect_command(
+            profile_id, m, line,
+        )))
+    }
+
+    /// 设备会话级纯读命令检查：需要真实设备、Profile、模式与认证上下文。
+    /// 不推进虚拟时间、不运行 `run_checks`、不发探测包。
+    pub fn verify_device_command(
+        &self,
+        dev: u32,
+        session_id: &str,
+        line: &str,
+    ) -> Result<String, JsValue> {
+        let inspection = self
+            .verify_device_command_checked(dev, session_id, line)
+            .map_err(|e| JsValue::from_str(&e))?;
+        Ok(inspection_json(&inspection))
+    }
+
+    /// 加载并返回迁移/会话清空报告；`load()` 保持原有无返回值契约。
+    pub fn load_with_report(&mut self, json: &str) -> Result<String, JsValue> {
+        let report = self
+            .apply_summary_checked(json)
+            .map_err(|e| JsValue::from_str(&e))?;
+        Ok(serde_json::json!({
+            "schemaVersion": report.schema_version,
+            "legacy": report.legacy,
+            "mappedProfiles": report.mapped_profiles,
+            "notices": report.notices,
+        })
+        .to_string())
     }
 
     /// 当前提示符。
@@ -278,36 +563,10 @@ impl Sim {
     }
 
     /// 应用拓扑摘要（保存/加载/分享的数据格式）。
+    /// 迁移与会话清空逻辑见 `apply_summary_checked`；UI 提示请用 `load_with_report`。
     pub fn load(&mut self, json: &str) -> Result<(), JsValue> {
-        let summary: NetSummary = serde_json::from_str(json)
-            .map_err(|e| JsValue::from_str(&format!("invalid topology: {}", e)))?;
-        // 先在临时引擎上构建，全部校验通过才替换——失败时保留当前拓扑
-        let mut eng = Engine::new(Net::new());
-        eng.net
-            .apply_summary(&summary)
+        self.apply_summary_checked(json)
             .map_err(|e| JsValue::from_str(&e))?;
-        eng.after_load();
-        self.eng = eng;
-        self.sessions.clear();
-        self.kind_counts.clear();
-        // 重建自动命名计数（从现有名字推断）
-        for d in &self.eng.net.devices {
-            let base = match d.kind {
-                DeviceKind::Router => "Router",
-                DeviceKind::Switch => "Switch",
-                DeviceKind::Host => "PC",
-                DeviceKind::Firewall => "FW",
-                DeviceKind::AccessPoint => "AP",
-                DeviceKind::WlanController => "AC",
-                DeviceKind::LoadBalancer => "LB",
-            };
-            if let Some(sfx) = d.name.strip_prefix(base) {
-                if let Ok(n) = sfx.parse::<u32>() {
-                    let slot = self.kind_counts.entry(base.to_string()).or_insert(0);
-                    *slot = (*slot).max(n);
-                }
-            }
-        }
         Ok(())
     }
 
@@ -315,10 +574,32 @@ impl Sim {
     pub fn reset(&mut self) {
         self.eng = Engine::new(Net::new());
         self.sessions.clear();
+        self.session_ids.clear();
+        // 会话序号保持单调：加载/重置后重新签发的令牌不得与旧令牌相同，
+        // 否则已失效的旧令牌会重新生效。
         self.kind_counts.clear();
     }
 
     // ---------- 实验检查（lab-checks） ----------
+
+    /// 纯读批量检查：只执行纯读项，主动项标 `skipped`；不推进时间、不收敛、不发包。
+    /// 入参为 Web `LabCheckDef` 的 `[{label, kind}]` JSON，设备名按真实引擎解析。
+    pub fn read_only_lab_checks(&self, defs_json: &str) -> Result<String, JsValue> {
+        let checks =
+            lab_defs::parse_lab_checks(&self.eng, defs_json).map_err(|e| JsValue::from_str(&e))?;
+        Ok(lab_defs::results_json(&lab_checks::run_read_only_checks(
+            &self.eng, &checks,
+        )))
+    }
+
+    /// 主动实验批量判分：整批一次完成必要收敛，再执行全部检查（含收敛后的状态项）。
+    /// 返回 `[{label, passed, detail, behavior, skipped}]`，负向探测同样标为主动行为。
+    pub fn run_lab_checks(&mut self, defs_json: &str) -> Result<String, JsValue> {
+        let checks =
+            lab_defs::parse_lab_checks(&self.eng, defs_json).map_err(|e| JsValue::from_str(&e))?;
+        let results = lab_checks::run_active_checks(&mut self.eng, &checks);
+        Ok(lab_defs::results_json(&results))
+    }
 
     /// 检查连通性：从 from 设备 ping 目标 IP。
     pub fn check_ping(&mut self, from: u32, to: &str) -> Result<String, JsValue> {
@@ -331,6 +612,7 @@ impl Sim {
                 expect: true,
             },
         }];
+        // Ping 是主动探测：走明示的主动入口（旧 run_checks 兼容契约）。
         let r = lab_checks::run_checks(&mut self.eng, &checks);
         Ok(serde_json::json!({
             "passed": r[0].passed,
@@ -352,7 +634,7 @@ impl Sim {
                 src: Some(sim_core::device::RouteSrc::Static),
             },
         }];
-        let r = lab_checks::run_checks(&mut self.eng, &checks);
+        let r = lab_checks::run_checks_read_only(&self.eng, &checks);
         Ok(serde_json::json!({
             "passed": r[0].passed,
             "detail": r[0].detail,
@@ -362,8 +644,8 @@ impl Sim {
 
     /// 检查 VLAN 已创建。
     pub fn check_vlan(&mut self, dev: u32, vlan: u16) -> Result<String, JsValue> {
-        let r = lab_checks::run_checks(
-            &mut self.eng,
+        let r = lab_checks::run_checks_read_only(
+            &self.eng,
             &[lab_checks::Check {
                 label: String::new(),
                 kind: lab_checks::CheckKind::VlanExists { dev, vlan },
@@ -374,8 +656,8 @@ impl Sim {
 
     /// 检查端口 Access VLAN。
     pub fn check_access_vlan(&mut self, dev: u32, port: u32, vlan: u16) -> Result<String, JsValue> {
-        let r = lab_checks::run_checks(
-            &mut self.eng,
+        let r = lab_checks::run_checks_read_only(
+            &self.eng,
             &[lab_checks::Check {
                 label: String::new(),
                 kind: lab_checks::CheckKind::AccessVlan {
@@ -395,8 +677,8 @@ impl Sim {
         port: u32,
         vlan: u16,
     ) -> Result<String, JsValue> {
-        let r = lab_checks::run_checks(
-            &mut self.eng,
+        let r = lab_checks::run_checks_read_only(
+            &self.eng,
             &[lab_checks::Check {
                 label: String::new(),
                 kind: lab_checks::CheckKind::TrunkAllows {
@@ -413,8 +695,8 @@ impl Sim {
     pub fn check_port_ip(&mut self, dev: u32, port: u32, ip: &str) -> Result<String, JsValue> {
         use sim_packets::ipv4_from_str;
         let ip = ipv4_from_str(ip).ok_or_else(|| JsValue::from_str("invalid ip"))?;
-        let r = lab_checks::run_checks(
-            &mut self.eng,
+        let r = lab_checks::run_checks_read_only(
+            &self.eng,
             &[lab_checks::Check {
                 label: String::new(),
                 kind: lab_checks::CheckKind::PortIp {
@@ -431,8 +713,8 @@ impl Sim {
     pub fn check_route(&mut self, dev: u32, dst: &str) -> Result<String, JsValue> {
         let (dst, len) = lab_checks::parse_net(dst)
             .ok_or_else(|| JsValue::from_str("invalid net, expect a.b.c.d/len"))?;
-        let r = lab_checks::run_checks(
-            &mut self.eng,
+        let r = lab_checks::run_checks_read_only(
+            &self.eng,
             &[lab_checks::Check {
                 label: String::new(),
                 kind: lab_checks::CheckKind::RouteExists {
@@ -450,8 +732,8 @@ impl Sim {
     pub fn check_evpn_route(&mut self, dev: u32, vtep: &str, vni: u32) -> Result<String, JsValue> {
         let vtep =
             sim_packets::ipv4_from_str(vtep).ok_or_else(|| JsValue::from_str("invalid VTEP"))?;
-        let r = lab_checks::run_checks(
-            &mut self.eng,
+        let r = lab_checks::run_checks_read_only(
+            &self.eng,
             &[lab_checks::Check {
                 label: String::new(),
                 kind: lab_checks::CheckKind::EvpnRoute { dev, vtep, vni },
@@ -470,8 +752,8 @@ impl Sim {
     ) -> Result<String, JsValue> {
         let vip =
             sim_packets::ipv4_from_str(vip).ok_or_else(|| JsValue::from_str("invalid VIP"))?;
-        let r = lab_checks::run_checks(
-            &mut self.eng,
+        let r = lab_checks::run_checks_read_only(
+            &self.eng,
             &[lab_checks::Check {
                 label: String::new(),
                 kind: lab_checks::CheckKind::LtmVirtual {
@@ -517,8 +799,8 @@ impl Sim {
         domain: u32,
         member: u32,
     ) -> Result<String, JsValue> {
-        let r = lab_checks::run_checks(
-            &mut self.eng,
+        let r = lab_checks::run_checks_read_only(
+            &self.eng,
             &[lab_checks::Check {
                 label: String::new(),
                 kind: lab_checks::CheckKind::StackMember {
@@ -533,8 +815,8 @@ impl Sim {
 
     /// 检查 M-LAG domain。
     pub fn check_mlag_domain(&mut self, dev: u32, domain: u32) -> Result<String, JsValue> {
-        let r = lab_checks::run_checks(
-            &mut self.eng,
+        let r = lab_checks::run_checks_read_only(
+            &self.eng,
             &[lab_checks::Check {
                 label: String::new(),
                 kind: lab_checks::CheckKind::MlagDomain {
@@ -548,8 +830,8 @@ impl Sim {
 
     /// 检查 VXLAN VNI 映射。
     pub fn check_vxlan_vni(&mut self, dev: u32, vlan: u32, vni: u32) -> Result<String, JsValue> {
-        let r = lab_checks::run_checks(
-            &mut self.eng,
+        let r = lab_checks::run_checks_read_only(
+            &self.eng,
             &[lab_checks::Check {
                 label: String::new(),
                 kind: lab_checks::CheckKind::VxlanVni {
@@ -564,8 +846,8 @@ impl Sim {
 
     /// 检查主机当前关联的 AP。
     pub fn check_wifi_on_ap(&mut self, dev: u32, ap: u32) -> Result<String, JsValue> {
-        let r = lab_checks::run_checks(
-            &mut self.eng,
+        let r = lab_checks::run_checks_read_only(
+            &self.eng,
             &[lab_checks::Check {
                 label: String::new(),
                 kind: lab_checks::CheckKind::WifiOnAp { dev, ap },
@@ -576,8 +858,8 @@ impl Sim {
 
     /// 检查 AP 已加入 AC。
     pub fn check_wlan_ap_joined(&mut self, ac: u32, ap: u32) -> Result<String, JsValue> {
-        let r = lab_checks::run_checks(
-            &mut self.eng,
+        let r = lab_checks::run_checks_read_only(
+            &self.eng,
             &[lab_checks::Check {
                 label: String::new(),
                 kind: lab_checks::CheckKind::WlanApJoined { ac, ap },
@@ -588,8 +870,8 @@ impl Sim {
 
     /// 检查 AC 的 SSID。
     pub fn check_wlan_ssid(&mut self, ac: u32, ssid: &str) -> Result<String, JsValue> {
-        let r = lab_checks::run_checks(
-            &mut self.eng,
+        let r = lab_checks::run_checks_read_only(
+            &self.eng,
             &[lab_checks::Check {
                 label: String::new(),
                 kind: lab_checks::CheckKind::WlanSsid {
@@ -603,8 +885,8 @@ impl Sim {
 
     /// 检查主机 Wi-Fi 关联。
     pub fn check_wifi_connected(&mut self, dev: u32) -> Result<String, JsValue> {
-        let r = lab_checks::run_checks(
-            &mut self.eng,
+        let r = lab_checks::run_checks_read_only(
+            &self.eng,
             &[lab_checks::Check {
                 label: String::new(),
                 kind: lab_checks::CheckKind::WifiConnected { dev },
@@ -615,8 +897,8 @@ impl Sim {
 
     /// 检查 IPsec 隧道是否存在。
     pub fn check_ipsec_tunnel(&mut self, dev: u32, name: &str) -> Result<String, JsValue> {
-        let r = lab_checks::run_checks(
-            &mut self.eng,
+        let r = lab_checks::run_checks_read_only(
+            &self.eng,
             &[lab_checks::Check {
                 label: String::new(),
                 kind: lab_checks::CheckKind::IpsecTunnel {
@@ -630,8 +912,8 @@ impl Sim {
 
     /// 检查主机 SSL VPN 会话。
     pub fn check_vpn_connected(&mut self, dev: u32) -> Result<String, JsValue> {
-        let r = lab_checks::run_checks(
-            &mut self.eng,
+        let r = lab_checks::run_checks_read_only(
+            &self.eng,
             &[lab_checks::Check {
                 label: String::new(),
                 kind: lab_checks::CheckKind::VpnConnected { dev },
@@ -647,8 +929,8 @@ impl Sim {
         port: u32,
         zone: &str,
     ) -> Result<String, JsValue> {
-        let r = lab_checks::run_checks(
-            &mut self.eng,
+        let r = lab_checks::run_checks_read_only(
+            &self.eng,
             &[lab_checks::Check {
                 label: String::new(),
                 kind: lab_checks::CheckKind::SecurityZone {
@@ -670,8 +952,8 @@ impl Sim {
         dst_zone: &str,
         permit: bool,
     ) -> Result<String, JsValue> {
-        let r = lab_checks::run_checks(
-            &mut self.eng,
+        let r = lab_checks::run_checks_read_only(
+            &self.eng,
             &[lab_checks::Check {
                 label: String::new(),
                 kind: lab_checks::CheckKind::SecurityPolicy {
@@ -688,8 +970,8 @@ impl Sim {
 
     /// 检查 VRRP 组是否为 Master。
     pub fn check_vrrp_master(&mut self, dev: u32, vrid: u32) -> Result<String, JsValue> {
-        let r = lab_checks::run_checks(
-            &mut self.eng,
+        let r = lab_checks::run_checks_read_only(
+            &self.eng,
             &[lab_checks::Check {
                 label: String::new(),
                 kind: lab_checks::CheckKind::VrrpMaster {
@@ -703,8 +985,8 @@ impl Sim {
 
     /// 检查 OSPF 邻居数量。
     pub fn check_ospf_neighbors(&mut self, dev: u32, min: u32) -> Result<String, JsValue> {
-        let r = lab_checks::run_checks(
-            &mut self.eng,
+        let r = lab_checks::run_checks_read_only(
+            &self.eng,
             &[lab_checks::Check {
                 label: String::new(),
                 kind: lab_checks::CheckKind::OspfNeighbors {
@@ -723,8 +1005,8 @@ impl Sim {
         port: u32,
         group: u32,
     ) -> Result<String, JsValue> {
-        let r = lab_checks::run_checks(
-            &mut self.eng,
+        let r = lab_checks::run_checks_read_only(
+            &self.eng,
             &[lab_checks::Check {
                 label: String::new(),
                 kind: lab_checks::CheckKind::PortIsolate {
@@ -748,8 +1030,8 @@ impl Sim {
                     .map_err(|_| JsValue::from_str("invalid mux role"))?,
             ),
         };
-        let r = lab_checks::run_checks(
-            &mut self.eng,
+        let r = lab_checks::run_checks_read_only(
+            &self.eng,
             &[lab_checks::Check {
                 label: String::new(),
                 kind: lab_checks::CheckKind::MuxRole {
@@ -764,8 +1046,8 @@ impl Sim {
 
     /// 检查 OSPFv3 邻居数。
     pub fn check_ospfv3_neighbors(&mut self, dev: u32, min: u32) -> Result<String, JsValue> {
-        let r = lab_checks::run_checks(
-            &mut self.eng,
+        let r = lab_checks::run_checks_read_only(
+            &self.eng,
             &[lab_checks::Check {
                 label: String::new(),
                 kind: lab_checks::CheckKind::Ospfv3Neighbors {
@@ -787,8 +1069,8 @@ impl Sim {
         let len: u8 = len
             .parse()
             .map_err(|_| JsValue::from_str("invalid prefix length"))?;
-        let r = lab_checks::run_checks(
-            &mut self.eng,
+        let r = lab_checks::run_checks_read_only(
+            &self.eng,
             &[lab_checks::Check {
                 label: String::new(),
                 kind: lab_checks::CheckKind::Srv6Route { dev, dst, len },
@@ -817,8 +1099,8 @@ impl Sim {
 
     /// 检查静态 LSP 是否存在（MPLS 实验判分）。
     pub fn check_mpls_lsp(&mut self, dev: u32, name: &str) -> Result<String, JsValue> {
-        let r = lab_checks::run_checks(
-            &mut self.eng,
+        let r = lab_checks::run_checks_read_only(
+            &self.eng,
             &[lab_checks::Check {
                 label: String::new(),
                 kind: lab_checks::CheckKind::MplsLsp {
@@ -834,8 +1116,8 @@ impl Sim {
     pub fn check_route_absent(&mut self, dev: u32, dst: &str) -> Result<String, JsValue> {
         let (dst, len) = lab_checks::parse_net(dst)
             .ok_or_else(|| JsValue::from_str("invalid net, expect a.b.c.d/len"))?;
-        let r = lab_checks::run_checks(
-            &mut self.eng,
+        let r = lab_checks::run_checks_read_only(
+            &self.eng,
             &[lab_checks::Check {
                 label: String::new(),
                 kind: lab_checks::CheckKind::RouteExists {
@@ -849,36 +1131,19 @@ impl Sim {
         Ok(serde_json::json!({ "passed": !r[0].passed, "detail": r[0].detail }).to_string())
     }
 
-    /// 校验一条命令在指定方言/模式下能否被解析（对照表与模拟器一致性的运行时验证）。
-    /// dialect: Ios | Vrp | Comware；mode: Exec | Priv | Config | If | Pool | Acl
+    /// **仅迁移期兼容**：旧的无状态 parse-only 语法检查，不证明设备支持、执行成功
+    /// 或状态正确。课程与对照表应改用 `inspect_command` / `verify_device_command`。
+    /// dialect: Ios | Vrp | Comware；mode: Exec | Priv | Config | If | Pool | Acl …
     pub fn verify_command(&self, dialect: &str, mode: &str, line: &str) -> bool {
         let d = match dialect {
             "Ios" | "ios" => Dialect::Ios,
             "Vrp" | "vrp" => Dialect::Vrp,
             "Comware" | "comware" => Dialect::Comware,
+            "Tmos" | "tmos" | "f5" => Dialect::Tmos,
             _ => return false,
         };
-        let m = match mode {
-            "Exec" => cli_engine::Mode::Exec,
-            "Priv" => cli_engine::Mode::Priv,
-            "Config" => cli_engine::Mode::Config,
-            "If" => cli_engine::Mode::If,
-            "Pool" => cli_engine::Mode::Pool,
-            "Acl" => cli_engine::Mode::Acl,
-            "Line" => cli_engine::Mode::Line,
-            "Aaa" => cli_engine::Mode::Aaa,
-            "Mst" => cli_engine::Mode::Mst,
-            "Ospf" => cli_engine::Mode::Ospf,
-            "OspfArea" => cli_engine::Mode::OspfArea,
-            "Bgp" => cli_engine::Mode::Bgp,
-            "Isis" => cli_engine::Mode::Isis,
-            "RoutePolicy" => cli_engine::Mode::RoutePolicy,
-            "Zone" => cli_engine::Mode::Zone,
-            "SecurityPolicy" => cli_engine::Mode::SecurityPolicy,
-            "SecurityRule" => cli_engine::Mode::SecurityRule,
-            "Ipsec" => cli_engine::Mode::Ipsec,
-            "Ospfv3" => cli_engine::Mode::Ospfv3,
-            _ => return false,
+        let Some(m) = mode_from(mode) else {
+            return false;
         };
         let trees = cli_dialects::trees(d);
         cli_engine::parse(trees.root_for(m), line)
@@ -888,8 +1153,8 @@ impl Sim {
 
     /// 检查是否 STP 根桥。
     pub fn check_root_bridge(&mut self, dev: u32) -> Result<String, JsValue> {
-        let r = lab_checks::run_checks(
-            &mut self.eng,
+        let r = lab_checks::run_checks_read_only(
+            &self.eng,
             &[lab_checks::Check {
                 label: String::new(),
                 kind: lab_checks::CheckKind::RootBridge { dev },
@@ -907,8 +1172,8 @@ impl Sim {
             "Alternate" | "ALTE" => StpRole::Alternate,
             _ => return Err(JsValue::from_str("unknown role")),
         };
-        let r = lab_checks::run_checks(
-            &mut self.eng,
+        let r = lab_checks::run_checks_read_only(
+            &self.eng,
             &[lab_checks::Check {
                 label: String::new(),
                 kind: lab_checks::CheckKind::PortRole {
@@ -925,8 +1190,8 @@ impl Sim {
     pub fn check_svi_ip(&mut self, dev: u32, vlan: u16, ip: &str) -> Result<String, JsValue> {
         use sim_packets::ipv4_from_str;
         let ip = ipv4_from_str(ip).ok_or_else(|| JsValue::from_str("invalid ip"))?;
-        let r = lab_checks::run_checks(
-            &mut self.eng,
+        let r = lab_checks::run_checks_read_only(
+            &self.eng,
             &[lab_checks::Check {
                 label: String::new(),
                 kind: lab_checks::CheckKind::SviIp { dev, vlan, ip },
@@ -937,8 +1202,8 @@ impl Sim {
 
     /// 检查端口是否属于指定聚合组。
     pub fn check_lag_member(&mut self, dev: u32, group: u16, port: u32) -> Result<String, JsValue> {
-        let r = lab_checks::run_checks(
-            &mut self.eng,
+        let r = lab_checks::run_checks_read_only(
+            &self.eng,
             &[lab_checks::Check {
                 label: String::new(),
                 kind: lab_checks::CheckKind::LagMember {
@@ -958,8 +1223,8 @@ impl Sim {
         group: u16,
         count: u32,
     ) -> Result<String, JsValue> {
-        let r = lab_checks::run_checks(
-            &mut self.eng,
+        let r = lab_checks::run_checks_read_only(
+            &self.eng,
             &[lab_checks::Check {
                 label: String::new(),
                 kind: lab_checks::CheckKind::LagSelected {
@@ -974,8 +1239,8 @@ impl Sim {
 
     /// 检查本地用户存在。
     pub fn check_mgmt_user(&mut self, dev: u32, name: &str) -> Result<String, JsValue> {
-        let r = lab_checks::run_checks(
-            &mut self.eng,
+        let r = lab_checks::run_checks_read_only(
+            &self.eng,
             &[lab_checks::Check {
                 label: String::new(),
                 kind: lab_checks::CheckKind::MgmtUser {
@@ -997,8 +1262,8 @@ impl Sim {
             "none" => VtyTransport::None,
             _ => return Err(JsValue::from_str("unknown transport")),
         };
-        let r = lab_checks::run_checks(
-            &mut self.eng,
+        let r = lab_checks::run_checks_read_only(
+            &self.eng,
             &[lab_checks::Check {
                 label: String::new(),
                 kind: lab_checks::CheckKind::VtyTransport { dev, transport: t },
@@ -1309,5 +1574,152 @@ impl Sim {
 impl Default for Sim {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod stage3a_tests;
+
+#[cfg(test)]
+mod stage4a_tests;
+
+#[cfg(test)]
+mod stage5a_tests;
+
+#[cfg(test)]
+mod stage6a_tests;
+
+#[cfg(test)]
+mod stage6b_tests;
+
+#[cfg(test)]
+mod c6b_tests;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cli_engine::{Mode, Session};
+
+    fn two_router_lab() -> Sim {
+        let mut sim = Sim::new();
+        let a = sim.add_device("Router", "Ios").unwrap();
+        let b = sim.add_device("Router", "Vrp").unwrap();
+        sim.add_link(a, b).unwrap();
+        sim
+    }
+
+    /// 把当前存档降级成阶段 0 旧档：去掉 schema_version 与设备 profile。
+    fn as_legacy(json: &str) -> String {
+        let mut v: serde_json::Value = serde_json::from_str(json).unwrap();
+        v.as_object_mut().unwrap().remove("schema_version");
+        for d in v["devices"].as_array_mut().unwrap() {
+            d.as_object_mut().unwrap().remove("profile");
+        }
+        v.to_string()
+    }
+
+    #[test]
+    fn new_archive_has_schema_version_and_profile() {
+        let sim = two_router_lab();
+        let v: serde_json::Value = serde_json::from_str(&sim.dump()).unwrap();
+        assert_eq!(v["schema_version"], SCHEMA_VERSION);
+        assert_eq!(v["devices"].as_array().unwrap().len(), 2);
+        for d in v["devices"].as_array().unwrap() {
+            assert!(d["profile"].is_string(), "新存档必须保存稳定 Profile ID");
+        }
+    }
+
+    #[test]
+    fn legacy_archive_loads_round_trips_and_reports_mapping() {
+        let sim = two_router_lab();
+        let legacy = as_legacy(&sim.dump());
+        assert!(!legacy.contains("schema_version"));
+        assert!(!legacy.contains("profile"), "旧档不得含 Profile 字段");
+
+        let mut target = Sim::new();
+        let report = target.apply_summary_checked(&legacy).unwrap();
+        assert!(report.legacy);
+        assert_eq!(report.schema_version, SCHEMA_VERSION);
+        assert_eq!(report.mapped_profiles, 2);
+        assert!(report
+            .notices
+            .iter()
+            .any(|n| n.contains(LEGACY_PROFILE_NOTICE)));
+        assert!(report.notices.iter().any(|n| n.contains(LOAD_RESET_NOTICE)));
+        assert!(report
+            .notices
+            .iter()
+            .any(|n| n.contains(profile_mod::IOS_ROUTER_PROFILE)));
+        assert!(report
+            .notices
+            .iter()
+            .any(|n| n.contains(profile_mod::VRP_ROUTER_PROFILE)));
+
+        let round: serde_json::Value = serde_json::from_str(&target.dump()).unwrap();
+        assert_eq!(round["schema_version"], SCHEMA_VERSION);
+        for d in round["devices"].as_array().unwrap() {
+            assert!(d["profile"].is_string());
+        }
+        assert_eq!(round["links"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn successful_load_clears_sessions_and_session_tokens() {
+        let mut sim = two_router_lab();
+        let dev = 0;
+        sim.sessions.insert(
+            dev,
+            Session {
+                mode: Mode::Config,
+                ..Default::default()
+            },
+        );
+        sim.session_ids.insert(dev, "stale-token".to_string());
+        sim.next_session_seq = 7;
+        assert_eq!(sim.sessions.len(), 2);
+
+        let archive = sim.dump();
+        sim.apply_summary_checked(&archive).unwrap();
+        assert!(sim.sessions.is_empty(), "加载后终端会话必须清空");
+        assert!(sim.session_ids.is_empty(), "旧会话令牌不得进入新工作区");
+        // 序号不回退：重新签发的令牌与旧令牌不同，旧上下文不会复活。
+        assert_eq!(sim.next_session_seq, 7);
+        assert_eq!(sim.eng.net.devices.len(), 2);
+    }
+
+    #[test]
+    fn failed_load_keeps_current_state() {
+        let mut sim = two_router_lab();
+        let before = sim.dump();
+        assert!(sim.apply_summary_checked("{ not json").is_err());
+        assert_eq!(sim.dump(), before);
+    }
+
+    #[test]
+    fn current_schema_archive_is_not_legacy() {
+        let sim = two_router_lab();
+        let archive = sim.dump();
+        let mut target = Sim::new();
+        let report = target.apply_summary_checked(&archive).unwrap();
+        assert!(!report.legacy);
+        assert_eq!(report.mapped_profiles, 0);
+        // 即使不是旧档，会话清空提示也必须给出。
+        assert!(report.notices.iter().any(|n| n.contains(LOAD_RESET_NOTICE)));
+    }
+
+    #[test]
+    fn inspect_command_is_platform_level_and_pure() {
+        let sim = two_router_lab();
+        let before = cli_dialects::state_fingerprint(&sim.eng);
+        let json = sim
+            .inspect_command(profile_mod::IOS_ROUTER_PROFILE, "Priv", "show ip route")
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["status"], "Executed");
+        assert_eq!(v["support"], "pending-verification");
+        assert_eq!(v["passed"], false);
+        assert!(v["detail"].as_str().unwrap().contains("平台级结果"));
+        assert_eq!(cli_dialects::state_fingerprint(&sim.eng), before);
+        assert_eq!(sim.eng.now_ns(), 0);
     }
 }

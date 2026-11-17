@@ -101,6 +101,76 @@ const COMWARE_CONFIG: &[&str] = &[
     "quit",
 ];
 
+/// 主机终端（Linux/OpenSSH 基线）的不可达文案：三个方言的登录源都是 PC 主机，
+/// 因此数据面拒绝时统一渲染主机基线的 `connect: Network is unreachable`；
+/// 路由器/防火墙作登录源时的平台文案见 `c6b_mgmt_grounding` 的文案矩阵。
+const HOST_UNREACHABLE: &str = "connect: Network is unreachable";
+
+/// C6b 破坏/恢复用例的参数包（避免逐项参数过多）。
+struct Breakage<'a> {
+    /// 承载管理地址的设备。
+    r1: u32,
+    /// 造成故障的配置命令（从用户视图进入）。
+    down: &'a [&'a str],
+    /// 恢复配置命令（承接破坏后的模式）。
+    up: &'a [&'a str],
+    /// 恢复后登录成功时应看到的远端提示符。
+    login_prompt: &'a str,
+}
+
+/// 完整登录一次（用户名/口令 + 提示符断言 + 断开）。
+fn login_once(eng: &mut Engine, sess: &mut Session, pc: u32, login_prompt: &str) {
+    let out = exec_and_run(eng, sess, pc, "ssh 192.168.1.1");
+    assert!(
+        out.contains("Trying") || out.contains("Connecting"),
+        "应重新进入登录流程: {out}"
+    );
+    assert_eq!(prompt(eng, sess, pc), "Username: ");
+    let _ = exec_and_run(eng, sess, pc, "admin");
+    assert_eq!(prompt(eng, sess, pc), "Password: ");
+    let _ = exec_and_run(eng, sess, pc, "Cisco@123");
+    assert_eq!(prompt(eng, sess, pc), login_prompt);
+    let _ = exec_and_run(eng, sess, pc, "exit");
+    assert_eq!(prompt(eng, sess, pc), "PC1>");
+}
+
+/// C6b：链路层面 down 时登录必须被拒绝（数据面接地），恢复后必须立即恢复登录能力。
+fn link_down_then_recover(eng: &mut Engine, sess: &mut Session, pc: u32, login_prompt: &str) {
+    let link = eng.net.links[0].id;
+    eng.net.link_mut(link).unwrap().up = false;
+    let out = exec_and_run(eng, sess, pc, "ssh 192.168.1.1");
+    assert!(
+        out.contains(HOST_UNREACHABLE),
+        "链路 down 时登录应被拒绝（期望 {HOST_UNREACHABLE}）: {out}"
+    );
+    assert_eq!(prompt(eng, sess, pc), "PC1>", "被拒绝后应回到本机提示符");
+    assert!(sess.login.is_none(), "被拒绝时不应进入登录流程");
+
+    eng.net.link_mut(link).unwrap().up = true;
+    login_once(eng, sess, pc, login_prompt);
+}
+
+/// C6b：对端接口 `shutdown` 时登录必须被拒绝（此前 ping 失败而 ssh 仍可登录）。
+fn interface_shutdown_then_recover(
+    eng: &mut Engine,
+    r1_sess: &mut Session,
+    pc_sess: &mut Session,
+    pc: u32,
+    b: &Breakage,
+) {
+    run(eng, r1_sess, b.r1, b.down);
+    let out = exec_and_run(eng, pc_sess, pc, "ssh 192.168.1.1");
+    assert!(
+        out.contains(HOST_UNREACHABLE),
+        "接口 shutdown 时登录应被拒绝（期望 {HOST_UNREACHABLE}）: {out}"
+    );
+    assert_eq!(prompt(eng, pc_sess, pc), "PC1>");
+    assert!(pc_sess.login.is_none());
+
+    run(eng, r1_sess, b.r1, b.up);
+    login_once(eng, pc_sess, pc, b.login_prompt);
+}
+
 #[test]
 fn ios_ssh_remote_session_golden() {
     let (mut eng, pc, r1) = lab(Dialect::Ios);
@@ -146,6 +216,35 @@ fn ios_ssh_remote_session_golden() {
     assert!(out.contains("Connection refused"), "{}", out);
     assert_eq!(prompt(&eng, &ps, pc), "PC1>");
     assert!(ps.login.is_none(), "被拒绝时不应进入登录流程");
+
+    // C6b 数据面接地：接口 shutdown / 链路 down 都必须让登录失败（覆盖更强方向）。
+    let mut cs = Session::default();
+    interface_shutdown_then_recover(
+        &mut eng,
+        &mut cs,
+        &mut ps,
+        pc,
+        &Breakage {
+            r1,
+            down: &[
+                "enable",
+                "configure terminal",
+                "interface g0/0",
+                "shutdown",
+                "exit",
+                "exit",
+            ],
+            up: &[
+                "configure terminal",
+                "interface g0/0",
+                "no shutdown",
+                "exit",
+                "exit",
+            ],
+            login_prompt: "EDGE1#",
+        },
+    );
+    link_down_then_recover(&mut eng, &mut ps, pc, "EDGE1#");
 }
 
 #[test]
@@ -168,6 +267,34 @@ fn vrp_ssh_remote_session_golden() {
 
     let out = exec_and_run(&mut eng, &mut ps, pc, "telnet 192.168.1.1");
     assert!(out.contains("refused"), "{}", out);
+
+    // C6b 数据面接地（VRP 同步评估，不只做 IOS）。
+    let mut cs = Session::default();
+    interface_shutdown_then_recover(
+        &mut eng,
+        &mut cs,
+        &mut ps,
+        pc,
+        &Breakage {
+            r1,
+            down: &[
+                "system-view",
+                "interface g0/0/0",
+                "shutdown",
+                "quit",
+                "quit",
+            ],
+            up: &[
+                "system-view",
+                "interface g0/0/0",
+                "undo shutdown",
+                "quit",
+                "quit",
+            ],
+            login_prompt: "<R1>",
+        },
+    );
+    link_down_then_recover(&mut eng, &mut ps, pc, "<R1>");
 }
 
 #[test]
@@ -187,6 +314,34 @@ fn comware_ssh_remote_session_golden() {
 
     let out = exec_and_run(&mut eng, &mut ps, pc, "telnet 192.168.1.1");
     assert!(out.contains("refused"), "{}", out);
+
+    // C6b 数据面接地（Comware 同步评估）。
+    let mut cs = Session::default();
+    interface_shutdown_then_recover(
+        &mut eng,
+        &mut cs,
+        &mut ps,
+        pc,
+        &Breakage {
+            r1,
+            down: &[
+                "system-view",
+                "interface g1/0/1",
+                "shutdown",
+                "quit",
+                "quit",
+            ],
+            up: &[
+                "system-view",
+                "interface g1/0/1",
+                "undo shutdown",
+                "quit",
+                "quit",
+            ],
+            login_prompt: "<R1>",
+        },
+    );
+    link_down_then_recover(&mut eng, &mut ps, pc, "<R1>");
 }
 
 #[test]

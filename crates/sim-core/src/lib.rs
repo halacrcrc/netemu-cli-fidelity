@@ -9,6 +9,7 @@
 pub mod device;
 pub mod engine;
 pub mod net;
+pub mod profile;
 pub mod summary;
 
 pub use device::*;

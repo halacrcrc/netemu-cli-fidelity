@@ -1598,8 +1598,158 @@ impl Engine {
         self.device_send_ip(dev_id, port, pkt, nexthop);
     }
 
-    /// 防火墙区域策略：同区域/未划分区域放行；跨区域按策略首条匹配，
-    /// 无命中默认拒绝；已放行的 ICMP 会话允许反向回包（30s）。
+    /// 防火墙设备使用的安全策略平台对象；不做防火墙数据面的设备返回 None。
+    ///
+    /// 平台差异全部来自显式策略对象（`profile::platform_policy_for`），共享数据面
+    /// 不写 `if dialect` 分支。阶段 6A 已删除 ASA `security-level` 回退路径。
+    fn firewall_policy_of(&self, dev_id: DevId) -> Option<crate::profile::FirewallPolicy> {
+        let d = self.net.device(dev_id)?;
+        let fw = crate::profile::platform_policy_for(d.dialect, d.kind).firewall;
+        (fw.model != crate::profile::FirewallPolicyModel::None).then_some(fw)
+    }
+
+    /// 接口所属安全区域。
+    fn firewall_zone_of(&self, dev_id: DevId, port: PortId) -> Option<String> {
+        self.net.device(dev_id)?.port(port)?.zone.clone()
+    }
+
+    /// 新流首包的安全策略判定：按顺序首条**启用**规则命中；无命中用平台缺省动作。
+    ///
+    /// `FlatRules`（VRP 基线）依据：V1（缺省策略 any/any → deny）、V4（域内安全策略
+    /// 缺省禁止，需手工放开）、V9（`display security-policy` 的 HITS 计数）。
+    /// `ZonePairs`（IOS XE ZBF）依据官方正文：zone-pair 方向 + policy-map class
+    /// 首条命中；inspect 建会话、pass 无状态、drop 丢弃；未配置策略即丢弃。
+    fn firewall_action(
+        &mut self,
+        dev_id: DevId,
+        in_port: PortId,
+        out_port: PortId,
+        src: Ipv4Addr,
+        dst: Ipv4Addr,
+        probe: FirewallProbe,
+    ) -> FirewallAction {
+        let Some(fw) = self.firewall_policy_of(dev_id) else {
+            return FirewallAction::AllowStateless;
+        };
+        let in_zone = self.firewall_zone_of(dev_id, in_port);
+        let out_zone = self.firewall_zone_of(dev_id, out_port);
+        match (in_zone.as_deref(), out_zone.as_deref()) {
+            // 两个接口都未划入区域：ZBF 不参与；VRP 沿用既有 PassThrough 语义。
+            (None, None) => match fw.unzoned {
+                crate::profile::UnzonedTraffic::ApplyDefault if !fw.interzone_default_permit => {
+                    FirewallAction::Deny
+                }
+                _ => FirewallAction::AllowStateless,
+            },
+            // 一侧已划区域、另一侧未划：IOS 官方「always dropped」；其余平台按既有策略。
+            (Some(_), None) | (None, Some(_)) => match fw.unzoned {
+                crate::profile::UnzonedTraffic::PassThrough => FirewallAction::AllowStateless,
+                crate::profile::UnzonedTraffic::ApplyDefault => default_action(&fw, false),
+                crate::profile::UnzonedTraffic::ZoneBoundaryDrop => FirewallAction::Deny,
+            },
+            (Some(in_zone), Some(out_zone)) => {
+                let same_zone = in_zone == out_zone;
+                match fw.model {
+                    crate::profile::FirewallPolicyModel::FlatRules => {
+                        let hit = {
+                            let Some(d) = self.net.device_mut(dev_id) else {
+                                return FirewallAction::AllowStateless;
+                            };
+                            let DeviceState::Router(rs) = &mut d.state else {
+                                return FirewallAction::AllowStateless;
+                            };
+                            let rule = rs.security_policies.iter_mut().find(|p| {
+                                p.enabled && p.src_zone == in_zone && p.dst_zone == out_zone
+                            });
+                            rule.map(|p| {
+                                p.hits += 1;
+                                if p.permit {
+                                    FirewallAction::AllowInspect
+                                } else {
+                                    FirewallAction::Deny
+                                }
+                            })
+                        };
+                        hit.unwrap_or_else(|| default_action(&fw, same_zone))
+                    }
+                    crate::profile::FirewallPolicyModel::ZonePairs => {
+                        match self.zbf_action(dev_id, in_zone, out_zone, src, dst, probe) {
+                            Some(action) => action,
+                            None => default_action(&fw, same_zone),
+                        }
+                    }
+                    crate::profile::FirewallPolicyModel::None => FirewallAction::AllowStateless,
+                }
+            }
+        }
+    }
+
+    /// IOS XE ZBF：按 zone-pair → policy-map → class-map 计算动作。
+    ///
+    /// 返回 None 表示没有对应 (源区域, 目的区域) 的 zone-pair，交给平台缺省；
+    /// 已配置 zone-pair 但没有 service-policy、或没有 class 命中且没有
+    /// class-default，都按官方「drop」处理。
+    fn zbf_action(
+        &mut self,
+        dev_id: DevId,
+        in_zone: &str,
+        out_zone: &str,
+        src: Ipv4Addr,
+        dst: Ipv4Addr,
+        probe: FirewallProbe,
+    ) -> Option<FirewallAction> {
+        let d = self.net.device_mut(dev_id)?;
+        let DeviceState::Router(rs) = &mut d.state else {
+            return None;
+        };
+        let Some(policy_name) = rs
+            .zbf_zone_pairs
+            .iter()
+            .find(|z| z.src_zone == in_zone && z.dst_zone == out_zone)
+            .and_then(|z| z.service_policy.clone())
+        else {
+            return rs
+                .zbf_zone_pairs
+                .iter()
+                .any(|z| z.src_zone == in_zone && z.dst_zone == out_zone)
+                .then_some(FirewallAction::Deny);
+        };
+        let Some(pm) = rs
+            .zbf_policy_maps
+            .iter_mut()
+            .find(|p| p.name == policy_name)
+        else {
+            return Some(FirewallAction::Deny);
+        };
+        for class in &mut pm.classes {
+            let matched = if class.is_default {
+                true
+            } else {
+                rs.zbf_class_maps
+                    .iter()
+                    .find(|c| c.name == class.class_name)
+                    .is_some_and(|cm| zbf_class_matches(cm, src, dst, probe, &rs.acls))
+            };
+            if !matched {
+                continue;
+            }
+            class.hits += 1;
+            match &class.action {
+                Some(action) => return Some(zbf_action_of(action)),
+                // class-default 未配置动作：官方缺省 drop；普通 class 未配置动作则
+                // 继续检查后续 class（与 policy-map 的“无动作”语义一致）。
+                None if class.is_default => return Some(FirewallAction::Deny),
+                None => continue,
+            }
+        }
+        Some(FirewallAction::Deny)
+    }
+
+    /// ICMP 的安全会话判定。
+    ///
+    /// 基线语义（V2）：命中会话表即转发，**不再复查策略**；未命中会话时
+    /// inspect 动作的 echo request 可建立新会话；pass 动作无状态放行（不建会话）；
+    /// drop 与未授权的新会话/回包一律拒绝。
     fn firewall_allow(
         &mut self,
         dev_id: DevId,
@@ -1607,63 +1757,60 @@ impl Engine {
         out_port: PortId,
         pkt: &Ipv4Packet,
     ) -> bool {
-        let (in_zone, out_zone, in_level, out_level) = {
-            let Some(d) = self.net.device(dev_id) else {
-                return true;
-            };
-            if d.kind != DeviceKind::Firewall {
-                return true;
-            }
-            let z = |p: PortId| d.port(p).and_then(|p| p.zone.clone());
-            let l = |p: PortId| d.port(p).and_then(|p| p.security_level);
-            (z(in_port), z(out_port), l(in_port), l(out_port))
+        let Some(fw) = self.firewall_policy_of(dev_id) else {
+            return true;
         };
         let now = self.now;
-        let Some(d) = self.net.device_mut(dev_id) else {
-            return true;
-        };
-        let DeviceState::Router(rs) = &mut d.state else {
-            return true;
-        };
-        rs.security_sessions.retain(|s| {
-            now.saturating_sub(s.last_ns) < 30_000_000_000
-                && !(s.src == pkt.src && s.dst == pkt.dst && s.icmp_id == pkt.icmp.id)
-        });
-        let reverse_session = rs
-            .security_sessions
-            .iter()
-            .any(|s| s.src == pkt.dst && s.dst == pkt.src && s.icmp_id == pkt.icmp.id);
-        if let (Some(in_zone), Some(out_zone)) = (in_zone, out_zone) {
-            if in_zone == out_zone || reverse_session {
+        {
+            let Some(d) = self.net.device_mut(dev_id) else {
+                return true;
+            };
+            let DeviceState::Router(rs) = &mut d.state else {
+                return true;
+            };
+            rs.security_sessions
+                .retain(|s| now.saturating_sub(s.last_ns) < fw.icmp_idle_ns);
+            // 会话匹配键：源/目的 IP + ICMP echo id，双向（回包按反向三元组命中）。
+            if let Some(s) = rs.security_sessions.iter_mut().find(|s| {
+                (s.src == pkt.src && s.dst == pkt.dst && s.icmp_id == pkt.icmp.id)
+                    || (s.src == pkt.dst && s.dst == pkt.src && s.icmp_id == pkt.icmp.id)
+            }) {
+                s.last_ns = now;
                 return true;
             }
-            let Some(policy) = rs
-                .security_policies
-                .iter()
-                .find(|p| p.src_zone == in_zone && p.dst_zone == out_zone)
-            else {
-                return false;
-            };
-            if !policy.permit {
-                return false;
-            }
-        } else if let (Some(il), Some(ol)) = (in_level, out_level) {
-            // ASA 默认：高安全级别 → 低安全级别放行，低 → 高默认拒绝（回包走会话）
-            if il < ol && !reverse_session {
-                return false;
-            }
-        } else {
-            return true;
         }
-        rs.security_sessions.push(SecuritySession {
-            src: pkt.src,
-            dst: pkt.dst,
-            icmp_id: pkt.icmp.id,
-            last_ns: now,
-        });
-        true
+        let probe = FirewallProbe::Icmp;
+        match self.firewall_action(dev_id, in_port, out_port, pkt.src, pkt.dst, probe) {
+            FirewallAction::Deny => false,
+            // pass：无状态放行，不建立会话；反向流量必须有镜像策略。
+            FirewallAction::AllowStateless => true,
+            // inspect：只允许发起方向的 echo request 建立会话；无会话回包拒绝。
+            FirewallAction::AllowInspect => {
+                if pkt.icmp.is_reply {
+                    return false;
+                }
+                let Some(d) = self.net.device_mut(dev_id) else {
+                    return true;
+                };
+                let DeviceState::Router(rs) = &mut d.state else {
+                    return true;
+                };
+                rs.security_sessions.push(SecuritySession {
+                    src: pkt.src,
+                    dst: pkt.dst,
+                    icmp_id: pkt.icmp.id,
+                    last_ns: now,
+                });
+                true
+            }
+        }
     }
 
+    /// TCP 的安全会话判定（双向五元组）。
+    ///
+    /// 基线语义（V2）：命中会话表即转发、不复查策略；未命中会话时只有 SYN
+    /// （不带 ACK）可由 inspect 建表，其余非会话报文直接丢弃。pass 动作的报文
+    /// 每包独立重新匹配策略（无状态），因此反向必须有镜像 pass 策略。
     fn firewall_tcp_allow(
         &mut self,
         dev_id: DevId,
@@ -1671,77 +1818,77 @@ impl Engine {
         out_port: PortId,
         tcp: &TcpPacket,
     ) -> bool {
-        let (in_zone, out_zone, in_level, out_level) = {
-            let Some(d) = self.net.device(dev_id) else {
-                return true;
-            };
-            if d.kind != DeviceKind::Firewall {
-                return true;
-            }
-            let z = |p: PortId| d.port(p).and_then(|p| p.zone.clone());
-            let l = |p: PortId| d.port(p).and_then(|p| p.security_level);
-            (z(in_port), z(out_port), l(in_port), l(out_port))
+        let Some(fw) = self.firewall_policy_of(dev_id) else {
+            return true;
         };
         let now = self.now;
-        let Some(d) = self.net.device_mut(dev_id) else {
-            return true;
-        };
-        let DeviceState::Router(rs) = &mut d.state else {
-            return true;
-        };
-        rs.tcp_flows
-            .retain(|f| now.saturating_sub(f.last_ns) < 60_000_000_000);
-        let existing = rs.tcp_flows.iter_mut().find(|f| {
-            (f.client == tcp.src
-                && f.server == tcp.dst
-                && f.client_port == tcp.src_port
-                && f.server_port == tcp.dst_port)
-                || (f.server == tcp.src
-                    && f.client == tcp.dst
-                    && f.server_port == tcp.src_port
-                    && f.client_port == tcp.dst_port)
-        });
-        if let Some(flow) = existing {
-            flow.last_ns = now;
-            if tcp.flags & TCP_RST != 0 {
-                flow.state = TcpFlowState::Closed;
-            } else if tcp.flags & TCP_FIN != 0 {
-                flow.state = TcpFlowState::FinWait;
-            } else if (tcp.flags & TCP_SYN != 0 && tcp.flags & TCP_ACK != 0)
-                || (tcp.flags & TCP_ACK != 0 && flow.state == TcpFlowState::SynSent)
-            {
-                flow.state = TcpFlowState::Established;
+        {
+            let Some(d) = self.net.device_mut(dev_id) else {
+                return true;
+            };
+            let DeviceState::Router(rs) = &mut d.state else {
+                return true;
+            };
+            rs.tcp_flows
+                .retain(|f| now.saturating_sub(f.last_ns) < fw.tcp_idle_ns);
+            if let Some(flow) = rs.tcp_flows.iter_mut().find(|f| tcp_flow_matches(f, tcp)) {
+                flow.last_ns = now;
+                if tcp.flags & TCP_RST != 0 {
+                    flow.state = TcpFlowState::Closed;
+                } else if tcp.flags & TCP_FIN != 0 {
+                    flow.state = TcpFlowState::FinWait;
+                } else if (tcp.flags & TCP_SYN != 0 && tcp.flags & TCP_ACK != 0)
+                    || (tcp.flags & TCP_ACK != 0 && flow.state == TcpFlowState::SynSent)
+                {
+                    flow.state = TcpFlowState::Established;
+                }
+                return true;
             }
-            return true;
         }
         let is_syn = tcp.flags & TCP_SYN != 0 && tcp.flags & TCP_ACK == 0;
-        let permitted = if let (Some(in_zone), Some(out_zone)) = (in_zone, out_zone) {
-            if in_zone == out_zone {
-                true
-            } else {
-                rs.security_policies
-                    .iter()
-                    .find(|p| p.src_zone == in_zone && p.dst_zone == out_zone)
-                    .map(|p| p.permit)
-                    .unwrap_or(false)
-            }
-        } else if let (Some(il), Some(ol)) = (in_level, out_level) {
-            il >= ol
-        } else {
-            true
+        let probe = FirewallProbe::Tcp {
+            src_port: tcp.src_port,
+            dst_port: tcp.dst_port,
         };
-        if !permitted || !is_syn {
-            return false;
+        match self.firewall_action(dev_id, in_port, out_port, tcp.src, tcp.dst, probe) {
+            FirewallAction::Deny => false,
+            FirewallAction::AllowStateless => true,
+            FirewallAction::AllowInspect => {
+                if !is_syn {
+                    return false;
+                }
+                let Some(d) = self.net.device_mut(dev_id) else {
+                    return true;
+                };
+                let DeviceState::Router(rs) = &mut d.state else {
+                    return true;
+                };
+                rs.tcp_flows.push(TcpFlow {
+                    client: tcp.src,
+                    server: tcp.dst,
+                    client_port: tcp.src_port,
+                    server_port: tcp.dst_port,
+                    state: TcpFlowState::SynSent,
+                    last_ns: now,
+                });
+                true
+            }
         }
-        rs.tcp_flows.push(TcpFlow {
-            client: tcp.src,
-            server: tcp.dst,
-            client_port: tcp.src_port,
-            server_port: tcp.dst_port,
-            state: TcpFlowState::SynSent,
-            last_ns: now,
-        });
-        true
+    }
+
+    /// 清除防火墙会话表（`reset firewall session table`），V3 的「立即生效」路径。
+    /// 返回被清除的会话数。
+    pub fn firewall_clear_sessions(&mut self, dev: DevId) -> usize {
+        let Some(d) = self.net.device_mut(dev) else {
+            return 0;
+        };
+        let DeviceState::Router(rs) = &mut d.state else {
+            return 0;
+        };
+        let n = rs.security_sessions.len() + rs.tcp_flows.len();
+        rs.security_sessions.clear();
+        rs.tcp_flows.clear();
+        n
     }
 
     /// ACL 判定：存在编号且命中规则按首条决定；无命中 = 隐式拒绝；编号未定义 = 放行。
@@ -1752,6 +1899,18 @@ impl Engine {
         src: Ipv4Addr,
         dst: Ipv4Addr,
     ) -> bool {
+        self.acl_decide_probe(dev_id, acl_no, src, dst, crate::device::AclProbe::icmp())
+    }
+
+    /// Stage 2B / C5：带 L4 上下文的 ACL 判定，供 TCP 探测走真实规则匹配。
+    fn acl_decide_probe(
+        &mut self,
+        dev_id: DevId,
+        acl_no: Option<u32>,
+        src: Ipv4Addr,
+        dst: Ipv4Addr,
+        probe: crate::device::AclProbe,
+    ) -> bool {
         let Some(no) = acl_no else { return true };
         let Some(d) = self.net.device_mut(dev_id) else {
             return true;
@@ -1760,7 +1919,7 @@ impl Engine {
             return true;
         };
         match rs.acls.iter_mut().find(|a| a.number == no) {
-            Some(acl) => acl.decide(src, dst, true).unwrap_or(false), // M2b 载荷均为 ICMP
+            Some(acl) => acl.decide(src, dst, probe).unwrap_or(false),
             None => true,
         }
     }
@@ -2302,6 +2461,17 @@ impl Engine {
             return;
         }
         tcp.ttl -= 1;
+        // Stage 2B / C5：接口入/出方向 ACL 同样约束 TCP 载荷，端口参与规则匹配。
+        let probe = crate::device::AclProbe::tcp(tcp.src_port, tcp.dst_port);
+        let acl_in = self
+            .net
+            .device(dev)
+            .and_then(|d| d.port(in_port))
+            .and_then(|p| p.acl_in);
+        if !self.acl_decide_probe(dev, acl_in, tcp.src, tcp.dst, probe) {
+            self.dropped += 1;
+            return;
+        }
         if d_kind(&self.net, dev) == DeviceKind::LoadBalancer
             && self.ltm_translate(dev, &mut tcp).is_none()
         {
@@ -2318,6 +2488,15 @@ impl Engine {
             return;
         };
         if !self.firewall_tcp_allow(dev, in_port, out_port, &tcp) {
+            self.dropped += 1;
+            return;
+        }
+        let acl_out = self
+            .net
+            .device(dev)
+            .and_then(|d| d.port(out_port))
+            .and_then(|p| p.acl_out);
+        if !self.acl_decide_probe(dev, acl_out, tcp.src, tcp.dst, probe) {
             self.dropped += 1;
             return;
         }
@@ -3342,33 +3521,58 @@ impl Engine {
         let DeviceState::Router(rs) = &mut d.state else {
             return;
         };
+        // Stage 2B / C3：显式 `dhcp select global` 的接口才充当服务器；
+        // 列表为空时保持原有「按接收接口网段匹配」行为。
+        if !rs.dhcp_server_ports.is_empty() && !rs.dhcp_server_ports.contains(&port) {
+            return;
+        }
         let pool = rs
             .dhcp_pools
             .iter()
             .find(|p| (p.network & mask_from_prefix(p.prefix)) == subnet && p.prefix == prefix)
             .cloned();
         let Some(pool) = pool else { return };
+        // 无匹配池 / 网关为 0 不得伪造主机配置：直接不应答。
+        if pool.gateway == 0 {
+            return;
+        }
 
         match dhcp.op {
             DhcpOp::Discover => {
-                // 分配：池内第一个未被租约占用的地址
-                let start = pool.network & mask_from_prefix(pool.prefix);
-                let size = 1u32 << (32 - pool.prefix).min(24);
-                let used: Vec<u32> = rs
+                // Stage 2B / C3：同一客户端重复 Discover 必须复用已有租约，
+                // 不得再占一个新地址（租约表也不得累加）。
+                let existing = rs
                     .dhcp_leases
                     .iter()
-                    .map(|l| l.ip)
-                    .chain(std::iter::once(pool.gateway))
-                    .collect();
-                let mut offer = None;
-                for i in 1..size.saturating_sub(1) {
-                    let cand = start + i;
-                    if !used.contains(&cand) && (cand & mask) == subnet {
-                        offer = Some(Ipv4Addr::from(cand));
-                        break;
+                    .find(|l| l.mac == dhcp.client_mac)
+                    .map(|l| l.ip);
+                let offered_ip = if let Some(ip) = existing {
+                    Ipv4Addr::from(ip)
+                } else {
+                    // 分配：池内第一个未被租约占用的地址
+                    let start = pool.network & mask_from_prefix(pool.prefix);
+                    let size = 1u32 << (32 - pool.prefix).min(24);
+                    let used: Vec<u32> = rs
+                        .dhcp_leases
+                        .iter()
+                        .map(|l| l.ip)
+                        .chain(std::iter::once(pool.gateway))
+                        .collect();
+                    let mut offer = None;
+                    for i in 1..size.saturating_sub(1) {
+                        let cand = start + i;
+                        let excluded = rs
+                            .dhcp_excluded
+                            .iter()
+                            .any(|(lo, hi)| cand >= *lo && cand <= *hi);
+                        if !used.contains(&cand) && !excluded && (cand & mask) == subnet {
+                            offer = Some(Ipv4Addr::from(cand));
+                            break;
+                        }
                     }
-                }
-                let Some(offered_ip) = offer else { return };
+                    let Some(offered_ip) = offer else { return };
+                    offered_ip
+                };
                 let out = DhcpPacket {
                     op: DhcpOp::Offer,
                     transaction_id: dhcp.transaction_id,
@@ -3934,6 +4138,16 @@ impl Engine {
         self.bgp_send_all(dev);
     }
 
+    /// 撤销 BGP 进程（undo bgp）：清空运行时会话/已学习路由并重算为空。
+    /// bgp_config_changed 在配置缺失时提前返回，无法承担清理职责。
+    pub fn bgp_reset(&mut self, dev: DevId) {
+        if let Some(rt) = self.bgp.get_mut(&dev) {
+            rt.sessions.clear();
+            rt.learned.clear();
+        }
+        self.bgp_recompute_routes(dev);
+    }
+
     fn bgp_schedule(&mut self, dev: DevId) {
         let rt = self.bgp.entry(dev).or_default();
         if !rt.timer_pending {
@@ -4135,6 +4349,21 @@ impl Engine {
             let Some(rt) = self.bgp.get_mut(&dev) else {
                 return;
             };
+            // 全表刷新语义：本邻居本轮 Update（经入向策略后）未携带的前缀视为撤销。
+            // 只撤销 from == 本邻居 的条目，保留其它邻居的更优路径。
+            let advertised: std::collections::HashSet<(Ipv4Addr, u8)> =
+                incoming.iter().map(|(k, _, _)| *k).collect();
+            let stale: Vec<(Ipv4Addr, u8)> = rt
+                .learned
+                .iter()
+                .filter(|(_, l)| l.from == pkt.src_ip)
+                .map(|(k, _)| *k)
+                .filter(|k| !advertised.contains(k))
+                .collect();
+            for k in stale {
+                rt.learned.remove(&k);
+                changed = true;
+            }
             for (key, path, local_pref) in incoming {
                 let better = match rt.learned.get(&key) {
                     None => true,
@@ -4753,8 +4982,38 @@ impl Engine {
         }
     }
 
+    /// Stage 2B / C7·H6：当前进程的真实区域号（旧存档缺省 0）。
+    pub fn ospf_area_of(&self, dev: DevId) -> u32 {
+        self.net
+            .device(dev)
+            .map(|d| match &d.state {
+                DeviceState::Router(rs) => rs.ospf_area,
+                _ => 0,
+            })
+            .unwrap_or(0)
+    }
+
+    /// Stage 2B / C7：链路 shutdown 后立刻撤销该口邻居与派生路由（不等 dead timer）。
+    pub fn ospf_link_changed(&mut self, dev: DevId, port: PortId) {
+        if let Some(rt) = self.ospf.get_mut(&dev) {
+            rt.neighbors.retain(|_, nb| nb.port != port);
+        }
+        self.ospf_recompute_all();
+        self.ospf_config_changed(dev);
+    }
+
+    /// Stage 2B / C7·H6：撤销 OSPF 进程时清空运行时邻居/LSDB 并重算全网路由。
+    pub fn ospf_reset(&mut self, dev: DevId) {
+        if let Some(rt) = self.ospf.get_mut(&dev) {
+            rt.neighbors.clear();
+            rt.lsdb.clear();
+        }
+        self.ospf_recompute_all();
+    }
+
     fn ospf_send_hello(&mut self, dev: DevId) {
         let lsa = self.ospf_build_lsa(dev);
+        let area = self.ospf_area_of(dev);
         for (port, ip, _) in self.ospf_enabled_ports(dev) {
             let Some(mac) = self
                 .net
@@ -4771,7 +5030,7 @@ impl Engine {
                 ethertype: ETHERTYPE_OSPF,
                 payload: L3::Ospf(OspfPacket {
                     kind: OspfKind::Hello,
-                    area: 0,
+                    area,
                     router_id: lsa.router_id,
                     src_ip: ip,
                     lsa,
@@ -4782,6 +5041,7 @@ impl Engine {
     }
 
     fn ospf_flood(&mut self, dev: DevId, lsa: OspfLsa, skip: Option<PortId>) {
+        let area = self.ospf_area_of(dev);
         for (port, ip, _) in self.ospf_enabled_ports(dev) {
             if skip == Some(port) {
                 continue;
@@ -4801,7 +5061,7 @@ impl Engine {
                 ethertype: ETHERTYPE_OSPF,
                 payload: L3::Ospf(OspfPacket {
                     kind: OspfKind::Lsu,
-                    area: 0,
+                    area,
                     router_id: lsa.router_id,
                     src_ip: ip,
                     lsa,
@@ -4812,7 +5072,11 @@ impl Engine {
     }
 
     fn ospf_on_packet(&mut self, dev: DevId, port: PortId, pkt: OspfPacket) {
-        if !self.ospf_enabled(dev) || !self.ospf_port_enabled(dev, port) || pkt.area != 0 {
+        // Stage 2B / C7·H6：区域必须一致才建邻，不再固定 area 0。
+        if !self.ospf_enabled(dev)
+            || !self.ospf_port_enabled(dev, port)
+            || pkt.area != self.ospf_area_of(dev)
+        {
             return;
         }
         let now = self.now;
@@ -5736,18 +6000,51 @@ impl Engine {
 
     // ---------- VRRP（主备虚拟网关，简化） ----------
 
+    /// Stage 2B / C8：按优先级与接口 IP 做确定性 Master/Backup 选举，
+    /// 不再把新建组无条件置为 Master；随后由通告定时器继续抢占/切换收敛。
     pub fn vrrp_config_changed(&mut self, dev: DevId) {
+        // 先收集同网段候选（vrid + vip 相同，且两台设备在该网段各有地址）。
+        let peers: Vec<(u8, Ipv4Addr, u8, Ipv4Addr, bool)> = {
+            let mut v = vec![];
+            for d in &self.net.devices {
+                if let DeviceState::Router(rs) = &d.state {
+                    for g in &rs.vrrp {
+                        let ip = d.port(g.port).and_then(|p| p.ip).unwrap_or(0);
+                        let up = d.port(g.port).is_some_and(|p| p.admin_up);
+                        v.push((g.vrid, g.vip, g.priority, ip, up));
+                    }
+                }
+            }
+            v
+        };
         let has = {
             let Some(d) = self.net.device_mut(dev) else {
                 return;
             };
+            let ports = d.ports.clone();
             let DeviceState::Router(rs) = &mut d.state else {
                 return;
             };
             for g in &mut rs.vrrp {
-                if g.state == VrrpState::Init {
-                    g.state = VrrpState::Master; // 通过通告收敛
+                let my_ip = ports.get(g.port).and_then(|p| p.ip).unwrap_or(0);
+                let my_up = ports.get(g.port).is_some_and(|p| p.admin_up);
+                if !my_up {
+                    g.state = VrrpState::Init;
+                    continue;
                 }
+                // 仅同一 vrid/vip 的其它设备参与比较；优先级相同比接口 IP。
+                let higher = peers.iter().any(|(vrid, vip, prio, ip, up)| {
+                    *vrid == g.vrid
+                        && *vip == g.vip
+                        && *ip != my_ip
+                        && *up
+                        && (*prio > g.priority || (*prio == g.priority && *ip > my_ip))
+                });
+                g.state = if higher {
+                    VrrpState::Backup
+                } else {
+                    VrrpState::Master
+                };
             }
             !rs.vrrp.is_empty()
         };
@@ -6066,29 +6363,215 @@ impl Engine {
         })
     }
 
-    /// 源设备到目标管理地址是否可达（路由存在；主机按同网段/有网关判断）。
-    fn mgmt_reachable(&self, from: DevId, ip: Ipv4Addr) -> bool {
-        let Some(d) = self.net.device(from) else {
+    /// 源设备到目标管理地址的 TCP 端口是否被数据面送达（C6b 决策 D1 的接地入口）。
+    ///
+    /// 判定复用数据面同一套机制，**不建立第二套转发路径**：
+    /// - 路由：`Net::lookup_route_vrf`（与 `tcp_forward` 同一张表，含 VRF）；
+    /// - 接口：`Port::oper_up` 语义（admin up + 有链路 + 链路 up，与 `transmit_frame`
+    ///   一致）以及**对端端口 admin up**（`transmit_frame` 的载波检测）；
+    /// - 接口 ACL：`acl_decide_probe`（与 `tcp_forward` 同一入口，入/出方向同序）；
+    /// - 防火墙：`firewall_action`（`ZonePairs` / `FlatRules` 的唯一策略判定入口）。
+    ///
+    /// 登录按**新流**判定：不复用、也不写入既有会话表。理由：每次登录在真实设备上
+    /// 都是一个新 TCP 连接（客户端端口不同），复用固定五元组会让「改了策略仍能登录」
+    /// 这种假象出现；反过来，登录前置检查也不应凭空造出一条永不关闭的会话。
+    ///
+    /// 目标设备自身只检查承载端口状态：发往设备自身的管理流量不经过 zone-pair
+    /// （官方 self 例外，6B 已核语义），接地时不得让 zone-pair 策略拒绝到设备自身
+    /// 的管理连接。
+    ///
+    /// 边界（已写入实施记录）：交换机在无管理路由时按 L2 透传处理，不细分 VLAN/STP；
+    /// 判定不发送真实报文、不推进虚拟时间。
+    fn mgmt_path_open(&mut self, from: DevId, target_ip: Ipv4Addr, proto: MgmtProto) -> bool {
+        let Some(src_ip) = self.mgmt_source_ip(from, target_ip) else {
             return false;
         };
+        let mut visited: Vec<(DevId, PortId)> = Vec::new();
+        self.mgmt_path_hop(from, None, src_ip, target_ip, proto, &mut visited)
+    }
+
+    /// 登录判定的源地址（仅用于 ACL/防火墙匹配）：主机取本机口，其余取路由出接口地址。
+    fn mgmt_source_ip(&self, from: DevId, target_ip: Ipv4Addr) -> Option<Ipv4Addr> {
+        let d = self.net.device(from)?;
         match &d.state {
-            DeviceState::Host(h) => {
-                let p = &d.ports[0];
-                match p.ip {
-                    Some(my) => {
-                        let mask = mask_from_prefix(p.prefix);
-                        (ip & mask) == (my & mask) || h.gw.is_some()
-                    }
-                    None => false,
-                }
+            DeviceState::Host(_) => d.ports.first().and_then(|p| p.ip),
+            _ => {
+                let (port, _, _) = self.net.lookup_route(from, target_ip)?;
+                d.port(port).and_then(|p| p.ip)
             }
-            _ => self.net.lookup_route(from, ip).is_some(),
         }
     }
 
-    /// 登录前置检查：找到目标、可达、VTY 允许该协议。成功返回目标设备 id。
-    pub fn login_target(
+    /// 逐跳走查：返回 true 表示 SYN 能到达持有 `target_ip` 的端口。
+    ///
+    /// `visited` 记录已走过的 (设备, 出端口)，同时充当环路护栏与规模上限
+    /// （不是转发语义，只是防止异常拓扑把判定拖成指数搜索）。
+    fn mgmt_path_hop(
+        &mut self,
+        cur: DevId,
+        in_port: Option<PortId>,
+        src_ip: Ipv4Addr,
+        target_ip: Ipv4Addr,
+        proto: MgmtProto,
+        visited: &mut Vec<(DevId, PortId)>,
+    ) -> bool {
+        const MAX_VISITED: usize = 64;
+        if visited.len() > MAX_VISITED {
+            return false;
+        }
+        // 目标设备自身：self 例外（6B 语义），只要求承载地址的端口 up。
+        if self.mgmt_ip_owner(target_ip) == Some(cur) {
+            return self.mgmt_owner_port_up(cur, target_ip);
+        }
+        let Some(d) = self.net.device(cur) else {
+            return false;
+        };
+        let kind = d.kind;
+        let dst_port = proto.port();
+        let client_port = 40_000 + (cur % 1_000) as u16;
+        let out_ports = self.mgmt_out_ports(cur, kind, in_port, target_ip);
+        for out_port in out_ports {
+            if visited.contains(&(cur, out_port)) {
+                continue;
+            }
+            visited.push((cur, out_port));
+            // 出接口：与 transmit_frame 相同的 up 判定。
+            let port_up = self
+                .net
+                .device(cur)
+                .and_then(|d| d.port(out_port))
+                .is_some_and(|p| p.admin_up && p.link.is_some_and(|l| self.net.link_up(l)));
+            if !port_up {
+                continue;
+            }
+            // 转发设备：ACL（入）→ 防火墙 → ACL（出），与 tcp_forward 同序。
+            // 源设备 in_port 为 None：设备自发流量不经过自身 zone-pair（self 例外）。
+            if let Some(inp) = in_port {
+                let probe = crate::device::AclProbe::tcp(client_port, dst_port);
+                let acl_in = self
+                    .net
+                    .device(cur)
+                    .and_then(|d| d.port(inp))
+                    .and_then(|p| p.acl_in);
+                if !self.acl_decide_probe(cur, acl_in, src_ip, target_ip, probe) {
+                    continue;
+                }
+                let fw_probe = FirewallProbe::Tcp {
+                    src_port: client_port,
+                    dst_port,
+                };
+                if self.firewall_action(cur, inp, out_port, src_ip, target_ip, fw_probe)
+                    == FirewallAction::Deny
+                {
+                    continue;
+                }
+                let acl_out = self
+                    .net
+                    .device(cur)
+                    .and_then(|d| d.port(out_port))
+                    .and_then(|p| p.acl_out);
+                if !self.acl_decide_probe(cur, acl_out, src_ip, target_ip, probe) {
+                    continue;
+                }
+            }
+            // 对端端口管理性关闭 → 链路不通（与 transmit_frame 的载波检测一致）。
+            let Some((peer, peer_port)) = self.mgmt_link_peer(cur, out_port) else {
+                continue;
+            };
+            let peer_up = self
+                .net
+                .device(peer)
+                .and_then(|d| d.port(peer_port))
+                .is_some_and(|p| p.admin_up);
+            if !peer_up {
+                continue;
+            }
+            if self.mgmt_path_hop(peer, Some(peer_port), src_ip, target_ip, proto, visited) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 当前设备的候选出接口。
+    ///
+    /// 主机：同网段直连或有网关才发；路由器/防火墙等：按路由表；交换机无管理路由时
+    /// 按 L2 透传向除入端口外的所有端口扩散（边界见 `mgmt_path_open`）。
+    fn mgmt_out_ports(
         &self,
+        cur: DevId,
+        kind: DeviceKind,
+        in_port: Option<PortId>,
+        target_ip: Ipv4Addr,
+    ) -> Vec<PortId> {
+        let Some(d) = self.net.device(cur) else {
+            return vec![];
+        };
+        match kind {
+            DeviceKind::Host => {
+                let Some(p0) = d.ports.first() else {
+                    return vec![];
+                };
+                let Some(my_ip) = p0.ip else {
+                    return vec![];
+                };
+                let mask = mask_from_prefix(p0.prefix);
+                let same_subnet = (target_ip & mask) == (my_ip & mask);
+                let gw = match &d.state {
+                    DeviceState::Host(h) => h.gw,
+                    _ => None,
+                };
+                if same_subnet || gw.is_some() {
+                    vec![0]
+                } else {
+                    vec![]
+                }
+            }
+            _ => {
+                let vrf = in_port
+                    .and_then(|p| d.port(p))
+                    .and_then(|p| p.vrf)
+                    .or_else(|| d.ports.first().and_then(|p| p.vrf));
+                if let Some((port, _, _)) = self.net.lookup_route_vrf(cur, vrf, target_ip) {
+                    return vec![port];
+                }
+                if matches!(kind, DeviceKind::Switch | DeviceKind::AccessPoint) {
+                    return d
+                        .ports
+                        .iter()
+                        .filter(|p| Some(p.idx) != in_port)
+                        .map(|p| p.idx)
+                        .collect();
+                }
+                vec![]
+            }
+        }
+    }
+
+    /// 承载目标管理地址的端口是否 oper up（物理口或启用的 SVI）。
+    fn mgmt_owner_port_up(&self, dev: DevId, ip: Ipv4Addr) -> bool {
+        let Some(d) = self.net.device(dev) else {
+            return false;
+        };
+        if let Some(p) = d.ports.iter().find(|p| p.ip == Some(ip)) {
+            return p.admin_up && p.link.is_some_and(|l| self.net.link_up(l));
+        }
+        if let DeviceState::Switch(sw) = &d.state {
+            return sw.svi.values().any(|s| s.ip == ip && s.admin_up);
+        }
+        false
+    }
+
+    /// 链路对端 (设备, 端口)。
+    fn mgmt_link_peer(&self, dev: DevId, port: PortId) -> Option<(DevId, PortId)> {
+        let link_id = self.net.device(dev)?.port(port)?.link?;
+        let l = self.net.link(link_id)?;
+        Some(if l.a.0 == dev { l.b } else { l.a })
+    }
+
+    /// 登录前置检查：找到目标、数据面可达、VTY 允许该协议。成功返回目标设备 id。
+    pub fn login_target(
+        &mut self,
         from: DevId,
         target_ip: Ipv4Addr,
         proto: MgmtProto,
@@ -6096,7 +6579,7 @@ impl Engine {
         let target = self
             .mgmt_ip_owner(target_ip)
             .ok_or(LoginError::Unreachable)?;
-        if target == from || !self.mgmt_reachable(from, target_ip) {
+        if target == from || !self.mgmt_path_open(from, target_ip, proto) {
             return Err(LoginError::Unreachable);
         }
         let Some(d) = self.net.device(target) else {
@@ -6110,7 +6593,7 @@ impl Engine {
 
     /// 尝试一次远程登录并认证。成功返回 (目标设备 id, 用户权限级别)。
     pub fn try_login(
-        &self,
+        &mut self,
         from: DevId,
         target_ip: Ipv4Addr,
         proto: MgmtProto,
@@ -6121,8 +6604,19 @@ impl Engine {
         let Some(d) = self.net.device(target) else {
             return Err(LoginError::Unreachable);
         };
-        if !d.mgmt.auth_local {
-            return Err(LoginError::AuthFailed);
+        // Stage 2B / C6a：裸 `login` 走线路口令，`login local` 走本地用户库。
+        match d.mgmt.effective_line_auth() {
+            crate::device::LineAuthMode::None => return Err(LoginError::AuthFailed),
+            crate::device::LineAuthMode::Line => {
+                let Some(p) = d.mgmt.line_password.as_deref() else {
+                    return Err(LoginError::AuthFailed);
+                };
+                if p != pass {
+                    return Err(LoginError::AuthFailed);
+                }
+                return Ok((target, 1));
+            }
+            crate::device::LineAuthMode::Local => {}
         }
         let Some(u) = d.mgmt.find_user(user) else {
             return Err(LoginError::AuthFailed);
@@ -7135,4 +7629,120 @@ fn d_kind(net: &Net, dev: DevId) -> DeviceKind {
     net.device(dev)
         .map(|d| d.kind)
         .unwrap_or(DeviceKind::Router)
+}
+
+/// TCP 会话匹配键：源 IP + 目的 IP + 源端口 + 目的端口 + 隐含 TCP 协议；
+/// 正反向均命中（回包按反方向五元组匹配），因此不需要单独的方向字段。
+fn tcp_flow_matches(f: &TcpFlow, t: &TcpPacket) -> bool {
+    (f.client == t.src
+        && f.server == t.dst
+        && f.client_port == t.src_port
+        && f.server_port == t.dst_port)
+        || (f.server == t.src
+            && f.client == t.dst
+            && f.server_port == t.src_port
+            && f.client_port == t.dst_port)
+}
+
+/// 新流判定所需的 L4 上下文（ZBF class-map 与 ACL 匹配共用）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FirewallProbe {
+    Icmp,
+    Tcp { src_port: u16, dst_port: u16 },
+}
+
+impl FirewallProbe {
+    fn acl(self) -> AclProbe {
+        match self {
+            FirewallProbe::Icmp => AclProbe::icmp(),
+            FirewallProbe::Tcp { src_port, dst_port } => AclProbe::tcp(src_port, dst_port),
+        }
+    }
+
+    fn is_icmp(self) -> bool {
+        matches!(self, FirewallProbe::Icmp)
+    }
+
+    fn tcp_dst_port(self) -> Option<u16> {
+        match self {
+            FirewallProbe::Tcp { dst_port, .. } => Some(dst_port),
+            FirewallProbe::Icmp => None,
+        }
+    }
+}
+
+/// 策略判定结果：拒绝 / 状态化放行（inspect）/ 无状态放行（pass）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FirewallAction {
+    Deny,
+    AllowInspect,
+    AllowStateless,
+}
+
+fn default_action(fw: &crate::profile::FirewallPolicy, same_zone: bool) -> FirewallAction {
+    let permit = if same_zone {
+        fw.intra_zone_default_permit
+    } else {
+        fw.interzone_default_permit
+    };
+    if permit {
+        FirewallAction::AllowStateless
+    } else {
+        FirewallAction::Deny
+    }
+}
+
+fn zbf_action_of(action: &ZbfAction) -> FirewallAction {
+    match action {
+        ZbfAction::Inspect { .. } => FirewallAction::AllowInspect,
+        ZbfAction::Pass => FirewallAction::AllowStateless,
+        ZbfAction::Drop { .. } => FirewallAction::Deny,
+    }
+}
+
+/// class-map 匹配：match-any / match-all 作用于其中全部 match 语句。
+///
+/// 空 class-map 不匹配任何流量（官方要求至少配置一条 match）。
+fn zbf_class_matches(
+    cm: &ZbfClassMap,
+    src: Ipv4Addr,
+    dst: Ipv4Addr,
+    probe: FirewallProbe,
+    acls: &[Acl],
+) -> bool {
+    if cm.matches.is_empty() {
+        return false;
+    }
+    let one = |m: &ZbfMatch| match m {
+        ZbfMatch::Protocol(name) => zbf_protocol_matches(name, probe),
+        ZbfMatch::AccessGroup(no) => acls
+            .iter()
+            .find(|a| a.number == *no)
+            .is_some_and(|a| a.matches_readonly(src, dst, probe.acl())),
+    };
+    match cm.match_type {
+        ZbfMatchType::Any => cm.matches.iter().any(one),
+        ZbfMatchType::All => cm.matches.iter().all(one),
+    }
+}
+
+/// `match protocol <name>` 的 L4 映射。
+///
+/// 本模拟器只承载 ICMP 与 TCP 的逐包转发；UDP 与 L7/ALG 协议没有数据面，
+/// 因此不会命中（配置仍按官方语法接受，边界在实施记录与讲义中明示）。
+fn zbf_protocol_matches(name: &str, probe: FirewallProbe) -> bool {
+    let n = name.to_ascii_lowercase();
+    let tcp_port = |p: u16| probe.tcp_dst_port() == Some(p);
+    match n.as_str() {
+        "icmp" | "echo" => probe.is_icmp(),
+        "tcp" => probe.tcp_dst_port().is_some(),
+        "http" => tcp_port(80),
+        "ftp" => tcp_port(21),
+        "smtp" | "esmtp" => tcp_port(25),
+        "pop3" => tcp_port(110),
+        "imap" => tcp_port(143),
+        // DNS 的 UDP 查询不在本模拟器数据面；TCP 53 仍按端口匹配。
+        "dns" => tcp_port(53),
+        _ => false,
+    }
 }

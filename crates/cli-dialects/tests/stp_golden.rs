@@ -164,7 +164,7 @@ fn zz_dump_acl_tree() {
         for n in nodes {
             let tok = match &n.tok {
                 cli_engine::Tok::Lit(w) => format!("L:{}", w),
-                cli_engine::Tok::Param { kind, name } => format!("P:{:?}:{}", kind, name),
+                cli_engine::Tok::Param { kind, name, .. } => format!("P:{:?}:{}", kind, name),
             };
             out.push(format!(
                 "{}{} run={} pkids={}",

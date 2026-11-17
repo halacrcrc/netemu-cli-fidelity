@@ -130,6 +130,16 @@ pub enum CheckKind {
         port: u16,
         expect: bool,
     },
+    /// 阶段 5A：主动发起多个 TCP 会话，断言实际分配到不同 LTM Member。
+    /// 只通过 `sim-core::Engine::ltm_sessions_of` 读取唯一状态源，不新建平行数据面。
+    LtmDistribution {
+        dev: DevId,
+        from: DevId,
+        to: Ipv4Addr,
+        port: u16,
+        sessions: usize,
+        min_distinct: usize,
+    },
     /// 检查端口隔离组。
     PortIsolate { dev: DevId, port: usize, group: u16 },
     /// 检查 MUX VLAN 端口角色。
@@ -163,31 +173,122 @@ pub struct CheckResult {
     pub detail: String,
 }
 
-pub fn run_checks(eng: &mut Engine, checks: &[Check]) -> Vec<CheckResult> {
-    // 让 STP 完成 Listening/Learning（约 30s）后再判分，避免端口仍在 Learning 时误判不通。
-    eng.run_to_quiescence(45_000_000_000);
-    checks.iter().map(|c| run_one(eng, c)).collect()
+/// 检查行为分类：只描述判分副作用，与命令四态 / 证据元数据相互独立。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CheckBehavior {
+    /// 只读取设备与协议状态：不推进虚拟时间、不运行协议收敛、不发送探测或登录。
+    ReadOnly,
+    /// 会推进协议收敛、发送 Ping/TCP 探测或发起登录尝试（含负向探测）。
+    ActiveExperiment,
 }
 
-fn run_one(eng: &mut Engine, c: &Check) -> CheckResult {
-    let (passed, detail) = match &c.kind {
-        CheckKind::Ping { from, to, expect } => {
-            let ok = ping_ok(eng, *from, *to);
-            (ok == *expect, {
-                if ok {
-                    "ping 连通".into()
-                } else {
-                    "ping 不通".into()
-                }
-            })
+impl CheckBehavior {
+    pub fn label(self) -> &'static str {
+        match self {
+            CheckBehavior::ReadOnly => "readOnly",
+            CheckBehavior::ActiveExperiment => "activeExperiment",
         }
+    }
+}
+
+impl CheckKind {
+    /// 行为分类的唯一来源：Rust 判分、WASM 结果与 Web 声明共用。
+    pub fn behavior(&self) -> CheckBehavior {
+        match self {
+            CheckKind::Ping { .. }
+            | CheckKind::Ping6 { .. }
+            | CheckKind::TcpProbe { .. }
+            | CheckKind::LtmDistribution { .. }
+            | CheckKind::LoginAttempt { .. } => CheckBehavior::ActiveExperiment,
+            _ => CheckBehavior::ReadOnly,
+        }
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.behavior() == CheckBehavior::ActiveExperiment
+    }
+}
+
+/// 组合检查项：`routeAbsent` 取反、`portRoleEither` 二选一；判断仍共用 `run_one`。
+#[derive(Clone, Debug)]
+pub enum CheckGroup {
+    Single(CheckKind),
+    Negate(CheckKind),
+    Either(CheckKind, CheckKind),
+}
+
+impl CheckGroup {
+    pub fn behavior(&self) -> CheckBehavior {
+        let active = match self {
+            CheckGroup::Single(k) => k.is_active(),
+            CheckGroup::Negate(k) => k.is_active(),
+            CheckGroup::Either(a, b) => a.is_active() || b.is_active(),
+        };
+        if active {
+            CheckBehavior::ActiveExperiment
+        } else {
+            CheckBehavior::ReadOnly
+        }
+    }
+}
+
+/// 实验声明的检查项（Web `LabCheckDef` 对应的 Rust 形态）。
+#[derive(Clone, Debug)]
+pub struct LabCheck {
+    pub label: String,
+    pub group: CheckGroup,
+}
+
+impl LabCheck {
+    pub fn single(label: impl Into<String>, kind: CheckKind) -> Self {
+        Self {
+            label: label.into(),
+            group: CheckGroup::Single(kind),
+        }
+    }
+
+    pub fn behavior(&self) -> CheckBehavior {
+        self.group.behavior()
+    }
+}
+
+/// 结构化检查结果：明确来源与是否被纯读路径跳过。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LabCheckResult {
+    pub label: String,
+    pub passed: bool,
+    pub detail: String,
+    pub behavior: CheckBehavior,
+    pub skipped: bool,
+}
+
+/// 主动判分沿用既有 STP 收敛语义；整个批次只收敛一次，不让每项重复推进。
+pub const ACTIVE_CONVERGENCE_NS: u64 = 45_000_000_000;
+
+/// 迁移期兼容入口：保持旧「先收敛再逐项判分」语义，内部走明示的主动入口。
+pub fn run_checks(eng: &mut Engine, checks: &[Check]) -> Vec<CheckResult> {
+    let labs: Vec<LabCheck> = checks
+        .iter()
+        .map(|c| LabCheck::single(c.label.clone(), c.kind.clone()))
+        .collect();
+    run_active_checks(eng, &labs)
+        .into_iter()
+        .map(|r| CheckResult {
+            label: r.label,
+            passed: r.passed,
+            detail: r.detail,
+        })
+        .collect()
+}
+
+/// 纯状态判断的唯一实现：只读 `&Engine`，不推进虚拟时间、不运行协议、不发包。
+/// 返回 None 表示该项属于主动探测，必须由 `eval_probe` 处理。
+fn eval_read_only(eng: &Engine, kind: &CheckKind) -> Option<(bool, String)> {
+    let (passed, detail) = match kind {
+        CheckKind::Ping { .. } => return None,
         CheckKind::RouteExists { dev, dst, len, src } => {
             let Some(d) = eng.net.device(*dev) else {
-                return CheckResult {
-                    label: c.label.clone(),
-                    passed: false,
-                    detail: "设备不存在".into(),
-                };
+                return Some((false, "设备不存在".into()));
             };
             let found = {
                 let mut found = false;
@@ -408,29 +509,7 @@ fn run_one(eng: &mut Engine, c: &Check) -> CheckResult {
                 },
             )
         }
-        CheckKind::LoginAttempt {
-            from,
-            to,
-            proto,
-            user,
-            pass,
-            expect,
-        } => {
-            let r = eng.try_login(*from, *to, *proto, user, pass);
-            let ok = r.is_ok();
-            let name = match proto {
-                MgmtProto::Telnet => "Telnet",
-                MgmtProto::Ssh => "SSH",
-            };
-            (
-                ok == *expect,
-                if ok {
-                    format!("{} 登录成功", name)
-                } else {
-                    format!("{} 登录被拒绝（{:?}）", name, r.err())
-                },
-            )
-        }
+        CheckKind::LoginAttempt { .. } => return None,
         CheckKind::MplsLsp { dev, name } => {
             let found = eng.net.device(*dev).and_then(|d| match &d.state {
                 sim_core::device::DeviceState::Router(rs) => {
@@ -512,14 +591,20 @@ fn run_one(eng: &mut Engine, c: &Check) -> CheckResult {
                 _ => None,
             });
             match found {
+                // 阶段 6A：规则被 `disable` 后不参与匹配，因此不再满足「存在 permit 策略」。
+                // 只有完整主动判分才会把状态推进/改变量暴露给用户；这里保持纯读。
                 Some(p) => (
-                    p.src_zone == *src_zone && p.dst_zone == *dst_zone && p.permit == *permit,
+                    p.src_zone == *src_zone
+                        && p.dst_zone == *dst_zone
+                        && p.permit == *permit
+                        && p.enabled,
                     format!(
-                        "策略 {}：{} → {} {}",
+                        "策略 {}：{} → {} {}（{}）",
                         p.name,
                         p.src_zone,
                         p.dst_zone,
-                        if p.permit { "permit" } else { "deny" }
+                        if p.permit { "permit" } else { "deny" },
+                        if p.enabled { "enable" } else { "disable" }
                     ),
                 ),
                 None => (false, format!("策略 {} 未配置", name)),
@@ -710,30 +795,7 @@ fn run_one(eng: &mut Engine, c: &Check) -> CheckResult {
                 },
             )
         }
-        CheckKind::TcpProbe {
-            from,
-            to,
-            port,
-            expect,
-        } => {
-            eng.start_tcp_probe(*from, *to, *port);
-            eng.run_to_quiescence(PING_HORIZON_NS);
-            let opened = eng.net.device(*from).and_then(|d| match &d.state {
-                sim_core::device::DeviceState::Host(hs) => {
-                    hs.tcp_probes.last().and_then(|p| p.opened)
-                }
-                _ => None,
-            });
-            let ok = opened == Some(true);
-            (
-                ok == *expect,
-                if ok {
-                    format!("TCP {}:{} 连接成功", ipv4_str(*to), port)
-                } else {
-                    format!("TCP {}:{} 未建立", ipv4_str(*to), port)
-                },
-            )
-        }
+        CheckKind::TcpProbe { .. } | CheckKind::LtmDistribution { .. } => return None,
         CheckKind::PortIsolate { dev, port, group } => {
             let got = eng
                 .net
@@ -774,6 +836,45 @@ fn run_one(eng: &mut Engine, c: &Check) -> CheckResult {
                 },
             )
         }
+        CheckKind::Ping6 { .. } => return None,
+        CheckKind::SviIp { dev, vlan, ip } => {
+            let got = eng.net.device(*dev).and_then(|d| match &d.state {
+                sim_core::device::DeviceState::Switch(sw) => sw.svi.get(vlan).map(|s| s.ip),
+                _ => None,
+            });
+            match got {
+                Some(actual) => (
+                    actual == *ip,
+                    format!(
+                        // 方言中性：VRP 用 Vlanif、Comware 用 Vlan-interface、IOS 用 Vlan，
+                        // 判分文案不得把 VRP 名称冒充 Comware（阶段 4A）。
+                        "VLAN{} SVI = {}（期望 {}）",
+                        vlan,
+                        ipv4_str(actual),
+                        ipv4_str(*ip)
+                    ),
+                ),
+                None => (false, format!("VLAN{} 未配置 SVI", vlan)),
+            }
+        }
+    };
+    Some((passed, detail))
+}
+
+/// 主动探测判断：Ping/Ping6/TcpProbe/LoginAttempt；负向断言同样是主动行为。
+fn eval_probe(eng: &mut Engine, kind: &CheckKind) -> (bool, String) {
+    match kind {
+        CheckKind::Ping { from, to, expect } => {
+            let ok = ping_ok(eng, *from, *to);
+            (
+                ok == *expect,
+                if ok {
+                    "ping 连通".into()
+                } else {
+                    "ping 不通".into()
+                },
+            )
+        }
         CheckKind::Ping6 { from, to, expect } => {
             let ok = ping6_ok(eng, *from, *to);
             (
@@ -785,30 +886,198 @@ fn run_one(eng: &mut Engine, c: &Check) -> CheckResult {
                 },
             )
         }
-        CheckKind::SviIp { dev, vlan, ip } => {
-            let got = eng.net.device(*dev).and_then(|d| match &d.state {
-                sim_core::device::DeviceState::Switch(sw) => sw.svi.get(vlan).map(|s| s.ip),
+        CheckKind::TcpProbe {
+            from,
+            to,
+            port,
+            expect,
+        } => {
+            eng.start_tcp_probe(*from, *to, *port);
+            eng.run_to_quiescence(PING_HORIZON_NS);
+            let opened = eng.net.device(*from).and_then(|d| match &d.state {
+                sim_core::device::DeviceState::Host(hs) => {
+                    hs.tcp_probes.last().and_then(|p| p.opened)
+                }
                 _ => None,
             });
-            match got {
-                Some(actual) => (
-                    actual == *ip,
-                    format!(
-                        "Vlanif{} = {}（期望 {}）",
-                        vlan,
-                        ipv4_str(actual),
-                        ipv4_str(*ip)
-                    ),
-                ),
-                None => (false, format!("VLAN{} 未配置 SVI", vlan)),
-            }
+            let ok = opened == Some(true);
+            (
+                ok == *expect,
+                if ok {
+                    format!("TCP {}:{} 连接成功", ipv4_str(*to), port)
+                } else {
+                    format!("TCP {}:{} 未建立", ipv4_str(*to), port)
+                },
+            )
         }
-    };
-    CheckResult {
-        label: c.label.clone(),
-        passed,
-        detail,
+        CheckKind::LtmDistribution {
+            dev,
+            from,
+            to,
+            port,
+            sessions,
+            min_distinct,
+        } => {
+            let mut opened_all = true;
+            for _ in 0..(*sessions).max(1) {
+                eng.start_tcp_probe(*from, *to, *port);
+                eng.run_to_quiescence(PING_HORIZON_NS);
+                let opened = eng.net.device(*from).and_then(|d| match &d.state {
+                    sim_core::device::DeviceState::Host(hs) => {
+                        hs.tcp_probes.last().and_then(|p| p.opened)
+                    }
+                    _ => None,
+                });
+                if opened != Some(true) {
+                    opened_all = false;
+                }
+            }
+            let sessions_now = eng.ltm_sessions_of(*dev);
+            let mut members: Vec<Ipv4Addr> = sessions_now.iter().map(|s| s.member_ip).collect();
+            members.sort_unstable();
+            members.dedup();
+            let ok = opened_all && members.len() >= (*min_distinct).max(2);
+            (
+                ok,
+                format!(
+                    "{} 个 TCP 会话 · {} 个不同 Member · {}",
+                    sessions_now.len(),
+                    members.len(),
+                    members
+                        .iter()
+                        .map(|m| ipv4_str(*m))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            )
+        }
+        CheckKind::LoginAttempt {
+            from,
+            to,
+            proto,
+            user,
+            pass,
+            expect,
+        } => {
+            let r = eng.try_login(*from, *to, *proto, user, pass);
+            let ok = r.is_ok();
+            let name = match proto {
+                MgmtProto::Telnet => "Telnet",
+                MgmtProto::Ssh => "SSH",
+            };
+            (
+                ok == *expect,
+                if ok {
+                    format!("{} 登录成功", name)
+                } else {
+                    format!("{} 登录被拒绝（{:?}）", name, r.err())
+                },
+            )
+        }
+        _ => (false, "非主动检查项".into()),
     }
+}
+
+/// 单项判断的唯一组合点：纯读判断优先，主动项才进入探测入口。
+fn run_one_value(eng: &mut Engine, kind: &CheckKind) -> (bool, String) {
+    match eval_read_only(eng, kind) {
+        Some(v) => v,
+        None => eval_probe(eng, kind),
+    }
+}
+
+fn eval_group_read_only(eng: &Engine, group: &CheckGroup) -> (bool, String) {
+    let pure = |k: &CheckKind| {
+        eval_read_only(eng, k).unwrap_or_else(|| (false, "主动项不应进入纯读判断".to_string()))
+    };
+    match group {
+        CheckGroup::Single(k) => pure(k),
+        CheckGroup::Negate(k) => {
+            let (p, d) = pure(k);
+            (!p, d)
+        }
+        CheckGroup::Either(a, b) => {
+            let (pa, da) = pure(a);
+            let (pb, db) = pure(b);
+            (pa || pb, format!("{da} / {db}"))
+        }
+    }
+}
+
+/// 纯读检查：只执行纯读项，不推进时间、不运行协议收敛、不发送探测或登录。
+/// 主动项返回 skipped，纯读通过不得据此把含主动项的实验标为完成。
+pub fn run_read_only_checks(eng: &Engine, checks: &[LabCheck]) -> Vec<LabCheckResult> {
+    checks
+        .iter()
+        .map(|c| {
+            let behavior = c.behavior();
+            if behavior == CheckBehavior::ActiveExperiment {
+                LabCheckResult {
+                    label: c.label.clone(),
+                    passed: false,
+                    detail: "主动实验项：纯读检查不执行，请运行实验判分".into(),
+                    behavior,
+                    skipped: true,
+                }
+            } else {
+                let (passed, detail) = eval_group_read_only(eng, &c.group);
+                LabCheckResult {
+                    label: c.label.clone(),
+                    passed,
+                    detail,
+                    behavior,
+                    skipped: false,
+                }
+            }
+        })
+        .collect()
+}
+
+/// 纯读批量检查的兼容入口：接受旧 `Check` 列表，返回旧 `CheckResult` 列表。
+/// 供 sim-wasm 现有 `check_*` 包装器使用，保持同步调用与 JSON 字段不变。
+pub fn run_checks_read_only(eng: &Engine, checks: &[Check]) -> Vec<CheckResult> {
+    let labs: Vec<LabCheck> = checks
+        .iter()
+        .map(|c| LabCheck::single(c.label.clone(), c.kind.clone()))
+        .collect();
+    run_read_only_checks(eng, &labs)
+        .into_iter()
+        .map(|r| CheckResult {
+            label: r.label,
+            passed: r.passed,
+            detail: r.detail,
+        })
+        .collect()
+}
+
+/// 主动实验判分：整批一次完成既有语义的协议收敛，再执行全部检查（含被动状态项）。
+pub fn run_active_checks(eng: &mut Engine, checks: &[LabCheck]) -> Vec<LabCheckResult> {
+    // 沿用旧语义：让 STP 完成 Listening/Learning（约 30s）后再判分。
+    eng.run_to_quiescence(ACTIVE_CONVERGENCE_NS);
+    checks
+        .iter()
+        .map(|c| {
+            let (passed, detail) = match &c.group {
+                CheckGroup::Single(k) => run_one_value(eng, k),
+                CheckGroup::Negate(k) => {
+                    let (p, d) = run_one_value(eng, k);
+                    (!p, d)
+                }
+                CheckGroup::Either(a, b) => {
+                    let (pa, da) = run_one_value(eng, a);
+                    let (pb, db) = run_one_value(eng, b);
+                    (pa || pb, format!("{da} / {db}"))
+                }
+            };
+            LabCheckResult {
+                label: c.label.clone(),
+                passed,
+                detail,
+                behavior: c.behavior(),
+                skipped: false,
+            }
+        })
+        .collect()
 }
 
 /// 发起一次 ping 并驱动引擎至静默，返回是否 5/5 全通。

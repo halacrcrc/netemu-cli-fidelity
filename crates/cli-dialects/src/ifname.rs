@@ -22,6 +22,8 @@ pub fn lag_canonical(dialect: Dialect, id: u16) -> String {
         Dialect::Ios => format!("Port-channel{}", id),
         Dialect::Vrp => format!("Eth-Trunk{}", id),
         Dialect::Comware => format!("Bridge-Aggregation{}", id),
+        // TMOS 无二层聚合口概念；保留中性标识，不冒充厂商名称。
+        Dialect::Tmos => format!("trunk{}", id),
     }
 }
 
@@ -31,6 +33,7 @@ pub fn lag_short(dialect: Dialect, id: u16) -> String {
         Dialect::Ios => format!("Po{}", id),
         Dialect::Vrp => format!("Eth-Trunk{}", id),
         Dialect::Comware => format!("BAGG{}", id),
+        Dialect::Tmos => format!("tr{}", id),
     }
 }
 
@@ -40,6 +43,8 @@ pub fn svi_canonical(dialect: Dialect, vlan: VlanId) -> String {
         Dialect::Ios => format!("Vlan{}", vlan),
         Dialect::Vrp => format!("Vlanif{}", vlan),
         Dialect::Comware => format!("Vlan-interface{}", vlan),
+        // TMOS 用 VLAN / self IP 对象，不用 SVI 接口名。
+        Dialect::Tmos => format!("vlan{}", vlan),
     }
 }
 
@@ -48,7 +53,9 @@ pub fn svi_short(dialect: Dialect, vlan: VlanId) -> String {
     match dialect {
         Dialect::Ios => format!("Vlan{}", vlan),
         Dialect::Vrp => format!("Vlanif{}", vlan),
-        Dialect::Comware => format!("Vlanif{}", vlan),
+        // 阶段 4A：Comware 短名不得沿用 VRP 的 Vlanif（官方为 Vlan-interface）。
+        Dialect::Comware => format!("Vlan-interface{}", vlan),
+        Dialect::Tmos => format!("vlan{}", vlan),
     }
 }
 
@@ -60,6 +67,8 @@ pub fn resolve_if(dialect: Dialect, kind: DeviceKind, s: &str) -> Option<IfRef> 
         Dialect::Ios => "vlan",
         Dialect::Vrp => "vlanif",
         Dialect::Comware => "vlan-interface",
+        // TMOS 命令树没有 SVI 接口视图；用不可能匹配的前缀避免误识别。
+        Dialect::Tmos => "\u{0}tmos-no-svi",
     };
     if let Some(rest) = lower.strip_prefix(svi_prefix) {
         if !matches!(kind, DeviceKind::Switch | DeviceKind::AccessPoint) {
@@ -77,6 +86,7 @@ pub fn resolve_if(dialect: Dialect, kind: DeviceKind, s: &str) -> Option<IfRef> 
             Dialect::Ios => &["port-channel", "portchannel", "po"],
             Dialect::Vrp => &["eth-trunk"],
             Dialect::Comware => &["bridge-aggregation", "bagg"],
+            Dialect::Tmos => &[],
         };
         for p in lag_prefixes {
             if let Some(rest) = lower.strip_prefix(p) {
@@ -110,6 +120,8 @@ pub fn canonical(dialect: Dialect, kind: DeviceKind, idx: usize) -> String {
             _ => format!("GigabitEthernet0/0/{}", idx + 1),
         },
         Dialect::Comware => format!("GigabitEthernet1/0/{}", idx + 1),
+        // BIG-IP 物理口官方编号 `<slot>.<port>`，tmsh `show net interface` 显示为 1.1 / 1.2 …
+        Dialect::Tmos => format!("1.{}", idx + 1),
     }
 }
 
@@ -130,6 +142,7 @@ pub fn short(dialect: Dialect, kind: DeviceKind, idx: usize) -> String {
             _ => format!("GE0/0/{}", idx + 1),
         },
         Dialect::Comware => format!("GE1/0/{}", idx + 1),
+        Dialect::Tmos => format!("1.{}", idx + 1),
     }
 }
 

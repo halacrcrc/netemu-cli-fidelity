@@ -3,9 +3,16 @@
 import './app.css';
 import { mount } from 'svelte';
 import App from './App.svelte';
-import { loadSim, dumpSummary } from './lib/sim';
+import { loadSim, dumpSummary, type LoadReport } from './lib/sim';
 import { app, refreshFrom } from './lib/store.svelte';
-import { currentWorkspace, loadWorkspace, markDirty, normalizeWorkspace, type Workspace } from './lib/persistence';
+import {
+  currentWorkspace,
+  loadWorkspace,
+  markDirty,
+  normalizeWorkspace,
+  setLoadNotices,
+  type Workspace,
+} from './lib/persistence';
 import { buildShareUrl, decodeWorkspace } from './lib/share';
 
 function applyEditor(ws: Workspace) {
@@ -34,10 +41,14 @@ async function boot() {
   let loaded = false;
   // 分享链接优先：URL hash 中的拓扑覆盖本地工作区
   const hash = location.hash;
+  const showLoadReport = (raw: string) => {
+    const report = JSON.parse(raw) as LoadReport;
+    setLoadNotices(report.notices);
+  };
   if (hash.startsWith('#topo=')) {
     try {
       const ws = normalizeWorkspace(await decodeWorkspace(hash.slice('#topo='.length)));
-      sim.load(JSON.stringify(ws.net));
+      showLoadReport(sim.load_with_report(JSON.stringify(ws.net)));
       applyEditor(ws);
       loaded = true;
     } catch (e) {
@@ -47,7 +58,7 @@ async function boot() {
   const ws = loaded ? null : loadWorkspace();
   if (ws) {
     try {
-      sim.load(JSON.stringify(ws.net));
+      showLoadReport(sim.load_with_report(JSON.stringify(ws.net)));
     } catch (e) {
       // 旧版本工作区格式不兼容：忽略并重新开始
       console.warn('工作区恢复失败，已重置', e);

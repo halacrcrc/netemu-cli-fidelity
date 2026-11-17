@@ -4,7 +4,7 @@
   import { Terminal } from '@xterm/xterm';
   import { FitAddon } from '@xterm/addon-fit';
   import '@xterm/xterm/css/xterm.css';
-  import { getSim, execCommand, promptOf, completeOf, dumpSummary } from '../lib/sim';
+  import { getSim, execCommandResult, promptOf, completeOf, dumpSummary } from '../lib/sim';
   import { app, deviceName, closeTerminal, refreshFrom } from '../lib/store.svelte';
   import { markDirty } from '../lib/persistence';
   import { theme } from '../lib/theme.svelte';
@@ -87,8 +87,12 @@
     }
     ed.histIdx = ed.history.length;
     if (line.trim()) {
-      const out = execCommand(getSim(), ed.dev, line);
-      if (out) ed.term.write(out + '\r\n');
+      const r = execCommandResult(getSim(), ed.dev, line);
+      // 设备文本与模拟器提示各自只渲染一次，不伪造厂商报错、不双写。
+      if (r.deviceOutput) ed.term.write(r.deviceOutput + '\r\n');
+      for (const n of r.simulatorNotices) {
+        ed.term.write('\x1b[90m' + n + '\x1b[0m\r\n');
+      }
       refreshSim();
     }
     ed.term.write(promptOf(getSim(), ed.dev));
@@ -139,7 +143,7 @@
       }
       case '?': {
         ed.term.write('?');
-        const out = execCommand(getSim(), ed.dev, ed.buffer);
+        const out = execCommandResult(getSim(), ed.dev, ed.buffer).deviceOutput;
         if (out) ed.term.write('\r\n' + out);
         ed.buffer = ed.buffer.replace(/[?]/g, '').trimEnd();
         ed.term.write('\r\n' + promptOf(getSim(), ed.dev) + ed.buffer);

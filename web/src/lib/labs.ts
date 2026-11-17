@@ -1,7 +1,7 @@
 // M1 实验定义：声明式拓扑 + 任务 + 校验项。（显示状态在 store.svelte.ts 中）
 
 import type { Sim } from '../wasm/net_sim';
-import { getSim, dumpSummary } from './sim';
+import { getSim, dumpSummary, labCheckApi } from './sim';
 import { refreshFrom, resetPositions, clearTabs, setSelected, setView, setPosition } from './store.svelte';
 import { markDirty } from './persistence';
 import { LABS_EN } from '../content/labs-en';
@@ -9,6 +9,8 @@ import { lang } from './i18n.svelte';
 
 export interface LabCheckDef {
   label: string;
+  /** 检查行为元数据；缺省由 kind 推导，显式声明可覆盖。 */
+  behavior?: CheckBehavior;
   kind:
     | { type: 'ping'; from: string; to: string; expect?: boolean }
     | { type: 'sviIp'; dev: string; vlan: number; ip: string }
@@ -34,6 +36,15 @@ export interface LabCheckDef {
     | { type: 'mlagDomain'; dev: string; domain: number }
     | { type: 'evpnRoute'; dev: string; vtep: string; vni: number }
     | { type: 'ltmVirtual'; dev: string; name: string; vip: string; port: number }
+    | {
+        type: 'ltmDistribution';
+        dev: string;
+        from: string;
+        to: string;
+        port: number;
+        sessions: number;
+        minDistinct: number;
+      }
     | { type: 'tcpProbe'; from: string; to: string; port: number; expect?: boolean }
     | { type: 'portIsolate'; dev: string; port: number; group: number }
     | { type: 'muxRole'; dev: string; port: number; role: 'principal' | 'separate' | 'group'; group?: number }
@@ -109,278 +120,95 @@ export function applyLab(lab: LabDef): void {
   markDirty();
 }
 
-/** 运行实验检查项，返回逐项结果（调用方负责写入响应式状态）。 */
-export function runLabChecks(lab: LabDef): { label: string; passed: boolean; detail: string }[] {
-  const sim = getSim();
-  const s = JSON.parse(sim.dump()) as { devices: { id: number; name: string }[] };
-  const byName = new Map(s.devices.map((d) => [d.name, d.id]));
-  const out: { label: string; passed: boolean; detail: string }[] = [];
-  const need = (name: string): number => {
-    const id = byName.get(name);
-    if (id === undefined) throw new Error(`找不到设备 ${name}`);
-    return id;
-  };
-  for (const ck of lab.checks) {
-    try {
-      if (ck.kind.type === 'ping') {
-        const from = need(ck.kind.from);
-        const r = JSON.parse(sim.check_ping(from, ck.kind.to)) as { passed: boolean; detail: string };
-        out.push({ label: ck.label, passed: r.passed === (ck.kind.expect !== false), detail: r.detail });
-      } else if (ck.kind.type === 'sviIp') {
-        const r = JSON.parse(sim.check_svi_ip(need(ck.kind.dev), ck.kind.vlan, ck.kind.ip)) as {
-          passed: boolean;
-          detail: string;
-        };
-        out.push({ label: ck.label, passed: r.passed, detail: r.detail });
-      } else if (ck.kind.type === 'accessVlan') {
-        const r = JSON.parse(sim.check_access_vlan(need(ck.kind.dev), ck.kind.port, ck.kind.vlan)) as {
-          passed: boolean;
-          detail: string;
-        };
-        out.push({ label: ck.label, passed: r.passed, detail: r.detail });
-      } else if (ck.kind.type === 'trunkAllows') {
-        const r = JSON.parse(sim.check_trunk_allows(need(ck.kind.dev), ck.kind.port, ck.kind.vlan)) as {
-          passed: boolean;
-          detail: string;
-        };
-        out.push({ label: ck.label, passed: r.passed, detail: r.detail });
-      } else if (ck.kind.type === 'vlanExists') {
-        const r = JSON.parse(sim.check_vlan(need(ck.kind.dev), ck.kind.vlan)) as {
-          passed: boolean;
-          detail: string;
-        };
-        out.push({ label: ck.label, passed: r.passed, detail: r.detail });
-      } else if (ck.kind.type === 'rootBridge') {
-        const r = JSON.parse(sim.check_root_bridge(need(ck.kind.dev))) as {
-          passed: boolean;
-          detail: string;
-        };
-        out.push({ label: ck.label, passed: r.passed, detail: r.detail });
-      } else if (ck.kind.type === 'portRoleEither') {
-        const r1 = JSON.parse(
-          sim.check_port_role(need(ck.kind.dev), ck.kind.portA, ck.kind.roleA)
-        ) as { passed: boolean; detail: string };
-        const r2 = JSON.parse(
-          sim.check_port_role(need(ck.kind.dev), ck.kind.portB, ck.kind.roleB)
-        ) as { passed: boolean; detail: string };
-        out.push({
-          label: ck.label,
-          passed: r1.passed || r2.passed,
-          detail: `${r1.detail} / ${r2.detail}`,
-        });
-      } else if (ck.kind.type === 'lagMember') {
-        const r = JSON.parse(sim.check_lag_member(need(ck.kind.dev), ck.kind.group, ck.kind.port)) as {
-          passed: boolean;
-          detail: string;
-        };
-        out.push({ label: ck.label, passed: r.passed, detail: r.detail });
-      } else if (ck.kind.type === 'lagSelected') {
-        const r = JSON.parse(sim.check_lag_selected(need(ck.kind.dev), ck.kind.group, ck.kind.count)) as {
-          passed: boolean;
-          detail: string;
-        };
-        out.push({ label: ck.label, passed: r.passed, detail: r.detail });
-      } else if (ck.kind.type === 'mgmtUser') {
-        const r = JSON.parse(sim.check_mgmt_user(need(ck.kind.dev), ck.kind.name)) as {
-          passed: boolean;
-          detail: string;
-        };
-        out.push({ label: ck.label, passed: r.passed, detail: r.detail });
-      } else if (ck.kind.type === 'vtyTransport') {
-        const r = JSON.parse(sim.check_vty_transport(need(ck.kind.dev), ck.kind.transport)) as {
-          passed: boolean;
-          detail: string;
-        };
-        out.push({ label: ck.label, passed: r.passed, detail: r.detail });
-      } else if (ck.kind.type === 'login') {
-        const r = JSON.parse(
-          sim.check_login(
-            need(ck.kind.from),
-            ck.kind.to,
-            ck.kind.proto,
-            ck.kind.user,
-            ck.kind.pass,
-            ck.kind.expect !== false
-          )
-        ) as { passed: boolean; detail: string };
-        out.push({ label: ck.label, passed: r.passed, detail: r.detail });
-      } else if (ck.kind.type === 'portRole') {
-        const r = JSON.parse(sim.check_port_role(need(ck.kind.dev), ck.kind.port, ck.kind.role)) as {
-          passed: boolean;
-          detail: string;
-        };
-        out.push({ label: ck.label, passed: r.passed, detail: r.detail });
-      } else if (ck.kind.type === 'portIp') {
-        const r = JSON.parse(sim.check_port_ip(need(ck.kind.dev), ck.kind.port, ck.kind.ip)) as {
-          passed: boolean;
-          detail: string;
-        };
-        out.push({ label: ck.label, passed: r.passed, detail: r.detail });
-      } else if (ck.kind.type === 'routeExists') {
-        const r = JSON.parse(sim.check_route(need(ck.kind.dev), ck.kind.net)) as {
-          passed: boolean;
-          detail: string;
-        };
-        out.push({ label: ck.label, passed: r.passed, detail: r.detail });
-      } else if (ck.kind.type === 'evpnRoute') {
-        const r = JSON.parse(sim.check_evpn_route(need(ck.kind.dev), ck.kind.vtep, ck.kind.vni)) as {
-          passed: boolean;
-          detail: string;
-        };
-        out.push({ label: ck.label, passed: r.passed, detail: r.detail });
-      } else if (ck.kind.type === 'ltmVirtual') {
-        const r = JSON.parse(
-          sim.check_ltm_virtual(need(ck.kind.dev), ck.kind.name, ck.kind.vip, ck.kind.port)
-        ) as { passed: boolean; detail: string };
-        out.push({ label: ck.label, passed: r.passed, detail: r.detail });
-      } else if (ck.kind.type === 'tcpProbe') {
-        const r = JSON.parse(
-          sim.check_tcp_probe(
-            need(ck.kind.from),
-            ck.kind.to,
-            ck.kind.port,
-            ck.kind.expect !== false
-          )
-        ) as { passed: boolean; detail: string };
-        out.push({ label: ck.label, passed: r.passed, detail: r.detail });
-      } else if (ck.kind.type === 'portIsolate') {
-        const r = JSON.parse(
-          sim.check_port_isolate(need(ck.kind.dev), ck.kind.port, ck.kind.group)
-        ) as { passed: boolean; detail: string };
-        out.push({ label: ck.label, passed: r.passed, detail: r.detail });
-      } else if (ck.kind.type === 'muxRole') {
-        const role = ck.kind.role === 'group' ? String(ck.kind.group ?? 0) : ck.kind.role;
-        const r = JSON.parse(
-          sim.check_mux_role(need(ck.kind.dev), ck.kind.port, role)
-        ) as { passed: boolean; detail: string };
-        out.push({ label: ck.label, passed: r.passed, detail: r.detail });
-      } else if (ck.kind.type === 'ospfv3Neighbors') {
-        const r = JSON.parse(
-          sim.check_ospfv3_neighbors(need(ck.kind.dev), ck.kind.min)
-        ) as { passed: boolean; detail: string };
-        out.push({ label: ck.label, passed: r.passed, detail: r.detail });
-      } else if (ck.kind.type === 'srv6Route') {
-        const r = JSON.parse(
-          sim.check_srv6_route(need(ck.kind.dev), ck.kind.dst)
-        ) as { passed: boolean; detail: string };
-        out.push({ label: ck.label, passed: r.passed, detail: r.detail });
-      } else if (ck.kind.type === 'ping6') {
-        const r = JSON.parse(
-          sim.check_ping6(need(ck.kind.from), ck.kind.to)
-        ) as { passed: boolean; detail: string };
-        out.push({
-          label: ck.label,
-          passed: r.passed === (ck.kind.expect !== false),
-          detail: r.detail,
-        });
-      } else if (ck.kind.type === 'stackMember') {
-        const r = JSON.parse(
-          sim.check_stack_member(need(ck.kind.dev), ck.kind.domain, ck.kind.member)
-        ) as { passed: boolean; detail: string };
-        out.push({ label: ck.label, passed: r.passed, detail: r.detail });
-      } else if (ck.kind.type === 'mlagDomain') {
-        const r = JSON.parse(sim.check_mlag_domain(need(ck.kind.dev), ck.kind.domain)) as {
-          passed: boolean;
-          detail: string;
-        };
-        out.push({ label: ck.label, passed: r.passed, detail: r.detail });
-      } else if (ck.kind.type === 'vxlanVni') {
-        const r = JSON.parse(sim.check_vxlan_vni(need(ck.kind.dev), ck.kind.vlan, ck.kind.vni)) as {
-          passed: boolean;
-          detail: string;
-        };
-        out.push({ label: ck.label, passed: r.passed, detail: r.detail });
-      } else if (ck.kind.type === 'wifiOnAp') {
-        const r = JSON.parse(sim.check_wifi_on_ap(need(ck.kind.dev), need(ck.kind.ap))) as {
-          passed: boolean;
-          detail: string;
-        };
-        out.push({ label: ck.label, passed: r.passed, detail: r.detail });
-      } else if (ck.kind.type === 'wlanApJoined') {
-        const r = JSON.parse(sim.check_wlan_ap_joined(need(ck.kind.ac), need(ck.kind.ap))) as {
-          passed: boolean;
-          detail: string;
-        };
-        out.push({ label: ck.label, passed: r.passed, detail: r.detail });
-      } else if (ck.kind.type === 'wlanSsid') {
-        const r = JSON.parse(sim.check_wlan_ssid(need(ck.kind.ac), ck.kind.ssid)) as {
-          passed: boolean;
-          detail: string;
-        };
-        out.push({ label: ck.label, passed: r.passed, detail: r.detail });
-      } else if (ck.kind.type === 'wifiConnected') {
-        const r = JSON.parse(sim.check_wifi_connected(need(ck.kind.dev))) as {
-          passed: boolean;
-          detail: string;
-        };
-        out.push({ label: ck.label, passed: r.passed, detail: r.detail });
-      } else if (ck.kind.type === 'ipsecTunnel') {
-        const r = JSON.parse(sim.check_ipsec_tunnel(need(ck.kind.dev), ck.kind.name)) as {
-          passed: boolean;
-          detail: string;
-        };
-        out.push({ label: ck.label, passed: r.passed, detail: r.detail });
-      } else if (ck.kind.type === 'vpnConnected') {
-        const r = JSON.parse(sim.check_vpn_connected(need(ck.kind.dev))) as {
-          passed: boolean;
-          detail: string;
-        };
-        out.push({ label: ck.label, passed: r.passed, detail: r.detail });
-      } else if (ck.kind.type === 'securityZone') {
-        const r = JSON.parse(
-          sim.check_security_zone(need(ck.kind.dev), ck.kind.port, ck.kind.zone)
-        ) as { passed: boolean; detail: string };
-        out.push({ label: ck.label, passed: r.passed, detail: r.detail });
-      } else if (ck.kind.type === 'securityPolicy') {
-        const r = JSON.parse(
-          sim.check_security_policy(
-            need(ck.kind.dev),
-            ck.kind.name,
-            ck.kind.srcZone,
-            ck.kind.dstZone,
-            ck.kind.permit
-          )
-        ) as { passed: boolean; detail: string };
-        out.push({ label: ck.label, passed: r.passed, detail: r.detail });
-      } else if (ck.kind.type === 'vrrpMaster') {
-        const r = JSON.parse(sim.check_vrrp_master(need(ck.kind.dev), ck.kind.vrid)) as {
-          passed: boolean;
-          detail: string;
-        };
-        out.push({ label: ck.label, passed: r.passed, detail: r.detail });
-      } else if (ck.kind.type === 'ospfNeighbors') {
-        const r = JSON.parse(sim.check_ospf_neighbors(need(ck.kind.dev), ck.kind.min)) as {
-          passed: boolean;
-          detail: string;
-        };
-        out.push({ label: ck.label, passed: r.passed, detail: r.detail });
-      } else if (ck.kind.type === 'mplsLsp') {
-        const r = JSON.parse(sim.check_mpls_lsp(need(ck.kind.dev), ck.kind.name)) as {
-          passed: boolean;
-          detail: string;
-        };
-        out.push({ label: ck.label, passed: r.passed, detail: r.detail });
-      } else if (ck.kind.type === 'routeAbsent') {
-        const r = JSON.parse(sim.check_route_absent(need(ck.kind.dev), ck.kind.net)) as {
-          passed: boolean;
-          detail: string;
-        };
-        out.push({ label: ck.label, passed: r.passed, detail: r.detail });
-      } else if (ck.kind.type === 'staticRoute') {
-        const r = JSON.parse(sim.check_static_route(need(ck.kind.dev), ck.kind.net)) as {
-          passed: boolean;
-          detail: string;
-        };
-        out.push({ label: ck.label, passed: r.passed, detail: r.detail });
-      }
-    } catch (e) {
-      out.push({ label: ck.label, passed: false, detail: String(e) });
-    }
+/** 检查行为分类：纯读 / 主动实验。不是命令执行四态，也不是证据等级。 */
+export type CheckBehavior = 'readOnly' | 'activeExperiment';
+
+/** 主动实验实际会发生的动作；只列本实验真正包含的探测类型。 */
+export type ActiveBehavior = 'converge' | 'ping' | 'ping6' | 'tcp' | 'login';
+
+/** 结构化结果：来源行为与纯读路径是否跳过，供 UI 逐项区分。 */
+export interface LabCheckResult {
+  label: string;
+  passed: boolean;
+  detail: string;
+  behavior: CheckBehavior;
+  skipped: boolean;
+}
+
+/** 行为分类唯一来源；与 lab-checks::CheckKind::behavior() 保持一致。 */
+export function checkBehavior(c: LabCheckDef): CheckBehavior {
+  if (c.behavior) return c.behavior;
+  switch (c.kind.type) {
+    case 'ping':
+    case 'ping6':
+    case 'tcpProbe':
+    case 'ltmDistribution':
+    case 'login':
+      return 'activeExperiment';
+    default:
+      return 'readOnly';
   }
-  return out.map((r, i) => ({
-    ...r,
-    label: lang() === 'en' && lab.en?.checkLabels[i] ? lab.en.checkLabels[i] : r.label,
+}
+
+export function labHasActiveChecks(lab: LabDef): boolean {
+  return lab.checks.some((c) => checkBehavior(c) === 'activeExperiment');
+}
+
+export function labHasReadOnlyChecks(lab: LabDef): boolean {
+  return lab.checks.some((c) => checkBehavior(c) === 'readOnly');
+}
+
+/** 主动判分整批一次收敛；探测类型只从本实验真实包含的主动项推导。 */
+export function labActiveBehaviors(lab: LabDef): ActiveBehavior[] {
+  const out: ActiveBehavior[] = ['converge'];
+  for (const c of lab.checks) {
+    if (checkBehavior(c) !== 'activeExperiment') continue;
+    const b: ActiveBehavior | null =
+      c.kind.type === 'ping'
+        ? 'ping'
+        : c.kind.type === 'ping6'
+          ? 'ping6'
+          : c.kind.type === 'tcpProbe' || c.kind.type === 'ltmDistribution'
+            ? 'tcp'
+            : c.kind.type === 'login'
+              ? 'login'
+              : null;
+    if (b && !out.includes(b)) out.push(b);
+  }
+  return out;
+}
+
+export type LabCheckMode = 'readOnly' | 'activeExperiment';
+
+/**
+ * 两条明示路径，均调用真实 WASM 批量入口，每次都基于当前引擎状态重新判分（不缓存）：
+ * - readOnly：只执行纯读项，不推进虚拟时间、不收敛、不发包；主动项标 skipped。
+ * - activeExperiment：整批一次完成协议收敛，再执行全部检查（含负向 Ping/登录尝试）。
+ */
+export function runLabChecks(
+  lab: LabDef,
+  mode: LabCheckMode = 'activeExperiment',
+): LabCheckResult[] {
+  const sim = getSim();
+  const defs = lab.checks.map((c, i) => ({
+    label: lang() === 'en' && lab.en?.checkLabels[i] ? lab.en.checkLabels[i] : c.label,
+    kind: c.kind,
   }));
+  const payload = JSON.stringify(defs);
+  const api = labCheckApi(sim);
+  const raw =
+    mode === 'readOnly' ? api.read_only_lab_checks(payload) : api.run_lab_checks(payload);
+  const results = JSON.parse(raw) as LabCheckResult[];
+  if (results.length !== lab.checks.length) {
+    throw new Error('实验检查结果数量与声明不一致');
+  }
+  return results.map((r, i) => {
+    const expected = checkBehavior(lab.checks[i]);
+    if (expected !== r.behavior) {
+      throw new Error(`检查行为分类不一致：${r.label}`);
+    }
+    return r;
+  });
 }
 
 // ---------- 实验一：二层办公网（VLAN 隔离） ----------
@@ -441,17 +269,17 @@ export const lab2: LabDef = {
   id: 'office-l3',
   title: '实验二 · 三层交换机 VLAN 间路由（SVI）',
   brief:
-    '一台三层交换机划两个 VLAN，配 Vlanif10 / Vlanif20 网关，实现 VLAN 间路由。体会"VLAN 隔离 + 三层互通"。',
+    '一台三层交换机划两个 VLAN，配 VLAN10 / VLAN20 的 SVI 网关，实现 VLAN 间路由。体会"VLAN 隔离 + 三层互通"。',
   tasks: [
-    'SW1：vlan batch 10 20',
-    'G0/0/1 → access VLAN10（接 PC1）；G0/0/2 → access VLAN20（接 PC2）',
-    'interface Vlanif10 配 192.168.10.1/24；interface Vlanif20 配 192.168.20.1/24（IOS：interface vlan 10）',
+    'SW1（Comware V7）：system-view → vlan 10 → quit → vlan 20 → quit',
+    'G1/0/1（接 PC1）/ G1/0/2（接 PC2）：interface g1/0/1 → port link-type access → port access vlan 10 → quit → interface g1/0/2 → port link-type access → port access vlan 20 → quit',
+    'interface Vlan-interface 10 → ip address 192.168.10.1 24 → quit → interface Vlan-interface 20 → ip address 192.168.20.1 24 → quit（IOS 对照：interface vlan 10）',
     'PC1 网关 192.168.10.1、PC2 网关 192.168.20.1（在属性面板填）',
-    '从 PC1 ping 192.168.20.12 —— 这次应该通了！',
+    'display vlan / display current-configuration 核对；从 PC1 ping 192.168.20.12 —— 这次应该通了！',
   ],
   checks: [
-    { label: 'Vlanif10 = 192.168.10.1', kind: { type: 'sviIp', dev: 'SW1', vlan: 10, ip: '192.168.10.1' } },
-    { label: 'Vlanif20 = 192.168.20.1', kind: { type: 'sviIp', dev: 'SW1', vlan: 20, ip: '192.168.20.1' } },
+    { label: 'VLAN10 SVI = 192.168.10.1', kind: { type: 'sviIp', dev: 'SW1', vlan: 10, ip: '192.168.10.1' } },
+    { label: 'VLAN20 SVI = 192.168.20.1', kind: { type: 'sviIp', dev: 'SW1', vlan: 20, ip: '192.168.20.1' } },
     { label: 'PC1 → PC2 跨 VLAN 连通', kind: { type: 'ping', from: 'PC1', to: '192.168.20.12' } },
   ],
   build: (sim) => {
@@ -479,7 +307,7 @@ export const lab3: LabDef = {
   brief:
     '两台交换机之间拉两条链路（成环）。观察 STP 如何自动阻塞一条、故障后如何收敛。抓包里能看到 BPDU。',
   tasks: [
-    '加载拓扑后等 30 秒（虚拟时间）让 STP 收敛，在 SW1 执行 show spanning-tree 看角色',
+    '加载拓扑后等 30 秒（虚拟时间）让 STP 收敛，在 SW1（VRP）执行 display stp brief 看角色',
     '两台交换机互联口配 Trunk 并放行 VLAN10（华为：port link-type trunk + allow-pass）',
     '把 SW1 设为根桥：system-view → stp priority 4096（IOS：spanning-tree vlan 1 priority 4096）',
     '选中一条互联链路开抓包，观察 BPDU 报文（每 2 秒一次）',
@@ -535,16 +363,16 @@ export const lab4: LabDef = {
     'R1：g0/0（内网口）配 192.168.1.1/24，g0/1（外网口）配 202.100.1.1/24，均 no shutdown',
     'R1：ip dhcp pool LAN → network 192.168.1.0 255.255.255.0 → default-router 192.168.1.1',
     'PC1 属性面板开启「DHCP 自动获取」→ 应拿到 192.168.1.2',
-    'R1：g0/0 配 ip nat inside、g0/1 配 ip nat outside；show ip nat translations 看转换',
+    'R1：g0/0 配 ip nat inside、g0/1 配 ip nat outside；用 show ip nat translations 核验转换表项',
     '（选做）access-list 100 deny icmp 192.168.1.0 0.0.0.255 202.100.1.0 0.0.0.255 + 接口应用，体验拦截',
-    'PC1 ping 202.100.1.100 —— 通了！你的流量已经 NAT 成公网地址',
+    'PC1 ping 202.100.1.100 —— 连通性检查；Ping 通过不能单独证明流量已 NAT 成公网地址，转换是否生效以 show ip nat translations 表项为准',
   ],
   checks: [
     {
       label: 'PC1 通过 DHCP 获取到 192.168.1.2',
       kind: { type: 'portIp', dev: 'PC1', port: 0, ip: '192.168.1.2' },
     },
-    { label: 'PC1 → 外网服务器连通（NAT 生效）', kind: { type: 'ping', from: 'PC1', to: '202.100.1.100' } },
+    { label: 'PC1 → 外网服务器连通（配置 NAT 后）', kind: { type: 'ping', from: 'PC1', to: '202.100.1.100' } },
     { label: 'R1 直连外网网段', kind: { type: 'routeExists', dev: 'R1', net: '202.100.1.0/24' } },
   ],
   build: (sim) => {
@@ -621,7 +449,7 @@ export const lab6: LabDef = {
     'R1：username admin privilege 15 secret Cisco@123',
     'R1：line vty 0 4 → login local → transport input ssh → exit',
     'PC1 终端：ssh 192.168.1.1 → 用户名 admin、口令 Cisco@123 → 看到 R1# 说明登录成功',
-    '登录后执行 show ip interface brief 查看 R1 接口，再 exit 断开',
+    'PC1 终端：show ip interface brief → exit（登录后在远端执行，查看 R1 接口后断开）',
     'PC1 终端：telnet 192.168.1.1 —— 应提示连接被拒绝（VTY 只开了 SSH）',
   ],
   checks: [
@@ -800,7 +628,7 @@ export const lab9: LabDef = {
     'CORE1（IOS）：g0/0 10.0.0.10/24 + vrrp 1 ip 10.0.0.1 + priority 200 + preempt + ip nat inside；g0/1 10.1.0.1/30；g0/2 203.0.113.1/24 + ip nat outside',
     'CORE1：ip route 192.168.0.0 255.255.0.0 10.0.0.2；router ospf 1 → network 10.1.0.0 0.0.0.3 area 0',
     'CORE2（IOS）：g0/0 10.0.0.11/24 + vrrp 1 ip 10.0.0.1；g0/1 10.1.0.2/30；router ospf 1 → network 10.1.0.0 0.0.0.3 area 0',
-    '验证：display vrrp（CORE1 Master）、show ip ospf neighbor（FULL）、display eth-trunk 1（2 Up）；PC1 ping PC2/PC3/203.0.113.10',
+    '验证（IOS CORE1/CORE2）：show vrrp（CORE1 Master）、show ip ospf neighbor（FULL）；验证（VRP SW1/SW2）：display eth-trunk 1（2 个 Selected 成员）；PC1 ping PC2/PC3/203.0.113.10',
   ],
   checks: [
     { label: 'SW1 聚合组 1 两个成员已选中', kind: { type: 'lagSelected', dev: 'SW1', group: 1, count: 2 } },
@@ -866,23 +694,27 @@ export const lab9: LabDef = {
 
 export const lab10: LabDef = {
   id: 'firewall-zone',
-  title: '实验十 · 防火墙安全区域与策略',
+  title: '实验十 · 防火墙安全区域与安全策略',
   brief:
-    '内网 PC 通过防火墙访问外网服务器。把两个接口分别划入 trust / untrust 区域，只放行 trust→untrust 的流量；untrust 主动访问内网被默认拒绝，回包由状态会话放行。',
+    '内网 PC 通过防火墙访问外网服务器。基线为华为 VRP 安全策略：接口先划入 trust / untrust 安全区域，再按区域对放行 trust→untrust。未命中任何规则时按平台缺省策略（any/any → deny）拒绝，同区域流量同样需要策略放行；首包命中策略后建立会话表，后续报文命中会话表直接转发、不再复查策略；要立即中断既有流必须清除会话表。',
   tasks: [
     'FW1：system-view → interface g0/0/0 → ip address 192.168.1.1 24 → undo shutdown → quit',
     'FW1：interface g0/0/1 → ip address 203.0.113.1 24 → undo shutdown → quit',
-    'FW1：firewall zone trust → add interface g0/0/0 → quit（IOS：zone security INSIDE + 接口 zone-member security INSIDE）',
+    'FW1：firewall zone trust → add interface g0/0/0 → quit',
     'FW1：firewall zone untrust → add interface g0/0/1 → quit',
     'FW1：security-policy → rule name allow-out → source-zone trust → destination-zone untrust → action permit → quit → quit',
-    'FW1：display firewall zone、display security-policy 检查区域与规则',
-    'SRV → PC1 先 ping 应不通（untrust 主动入内网被默认拒绝）；PC1 → SRV ping 应通，回包由状态会话放行',
+    'FW1：return → display firewall zone → display security-policy → display firewall session table（退回用户视图后核对区域成员、规则 STATE/ACTION 与会话表）',
+    'SRV：ping 192.168.1.10（应先不通：未命中策略，按缺省策略拒绝）',
+    'PC1：ping 203.0.113.10（应通：命中 allow-out；回包不复查策略，靠会话表放行）',
+    'FW1：system-view → security-policy → rule name allow-out → disable → quit → quit → return → reset firewall session table（禁用规则并清表，使既有流立即失效）',
+    'FW1：display security-policy → display firewall session table（规则 STATE 应为 disable，会话表应为空）',
+    'PC1：ping 203.0.113.10（现在应不通：新流不再命中已禁用规则）',
   ],
   checks: [
     { label: 'FW1 G0/0/0 已划入 trust 区域', kind: { type: 'securityZone', dev: 'FW1', port: 0, zone: 'trust' } },
     { label: 'FW1 G0/0/1 已划入 untrust 区域', kind: { type: 'securityZone', dev: 'FW1', port: 1, zone: 'untrust' } },
     {
-      label: '存在 trust → untrust permit 策略',
+      label: '存在启用的 trust → untrust permit 策略',
       kind: {
         type: 'securityPolicy',
         dev: 'FW1',
@@ -892,8 +724,8 @@ export const lab10: LabDef = {
         permit: true,
       },
     },
-    { label: 'SRV → PC1 被默认拒绝', kind: { type: 'ping', from: 'SRV', to: '192.168.1.10', expect: false } },
-    { label: 'PC1 → SRV 放行（状态化回包）', kind: { type: 'ping', from: 'PC1', to: '203.0.113.10' } },
+    { label: 'SRV → PC1 被缺省策略拒绝', kind: { type: 'ping', from: 'SRV', to: '192.168.1.10', expect: false } },
+    { label: 'PC1 → SRV 放行（回包走会话表）', kind: { type: 'ping', from: 'PC1', to: '203.0.113.10' } },
   ],
   build: (sim) => {
     const pc1 = sim.add_device('Host', 'Ios');
@@ -1312,27 +1144,35 @@ export const lab19: LabDef = {
   id: 'f5-ltm',
   title: '实验十九 · F5 LTM 负载均衡',
   brief:
-    'F5 负载均衡器对外提供 VIP 10.0.0.100:80，后端池有两台服务器。客户端 TCP 连接 VIP，LTM 轮询选择成员并做目的/源地址转换，回程由 VIP 返回。',
+    'F5 BIG-IP TMOS 17.x（tmsh）对外提供 VIP 10.0.0.100:80，后端池有两台服务器。客户端 TCP 连接 VIP，LTM 轮询选择成员并做目的/源地址转换，回程由 VIP 返回。前三步是 tmsh 严格可顺序执行的命令序列。',
   tasks: [
-    'LB1：G0/0/0 接客户端 10.0.0.1/24；G0/0/1 接 SRV1 10.0.1.1/24；G0/0/2 接 SRV2 10.0.2.1/24，均 undo shutdown',
-    'LB1：ltm pool WEB member 10.0.1.10 80',
-    'LB1：ltm pool WEB member 10.0.2.11 80',
-    'LB1：ltm virtual VS vip 10.0.0.100 80 pool WEB',
-    'display ltm：应看到 VS → WEB，池内两个成员',
-    'PC1：tcp 10.0.0.100 80 连续执行两次，两次都应“连接成功”',
-    'display ltm：Sessions 中应出现两条会话，分别指向不同成员（轮询）',
+    'LB1（tmsh root (tmos)#）：ltm → create pool WEB → modify pool WEB members add { 10.0.1.10:80 } → modify pool WEB members add { 10.0.2.11:80 }',
+    'create virtual VS destination 10.0.0.100:80 pool WEB → list pool /Common/WEB → list virtual /Common/VS → exit',
+    'sys → list version → exit → quit',
+    'PC1 网关 10.0.0.1、SRV1 网关 10.0.1.1、SRV2 网关 10.0.2.1（在属性面板填）',
+    'PC1：tcp 10.0.0.100 80 连续三次；LB1 的 show ltm pool 查看 Sessions 是否分配到不同 Member',
   ],
   checks: [
     {
-      label: 'LB1 虚拟服务器 VS = 10.0.0.100:80',
+      label: 'LB1 虚拟服务器 VS = 10.0.0.100:80（纯读）',
       kind: { type: 'ltmVirtual', dev: 'LB1', name: 'VS', vip: '10.0.0.100', port: 80 },
     },
-    { label: 'PC1 第一次连接 VIP 成功', kind: { type: 'tcpProbe', from: 'PC1', to: '10.0.0.100', port: 80 } },
-    { label: 'PC1 第二次连接 VIP 成功', kind: { type: 'tcpProbe', from: 'PC1', to: '10.0.0.100', port: 80 } },
+    {
+      label: '三次 TCP 会话实际分配到不同 Member（主动探测）',
+      kind: {
+        type: 'ltmDistribution',
+        dev: 'LB1',
+        from: 'PC1',
+        to: '10.0.0.100',
+        port: 80,
+        sessions: 3,
+        minDistinct: 2,
+      },
+    },
   ],
   build: (sim) => {
     const pc1 = sim.add_device('Host', 'Ios');
-    const lb = sim.add_device('LoadBalancer', 'Vrp');
+    const lb = sim.add_device('LoadBalancer', 'Tmos');
     const s1 = sim.add_device('Host', 'Ios');
     const s2 = sim.add_device('Host', 'Ios');
     sim.rename_device(pc1, 'PC1');
@@ -1345,6 +1185,11 @@ export const lab19: LabDef = {
     sim.set_host_config(pc1, '10.0.0.10', 24, '10.0.0.1');
     sim.set_host_config(s1, '10.0.1.10', 24, '10.0.1.1');
     sim.set_host_config(s2, '10.0.2.11', 24, '10.0.2.1');
+    // 实验拓扑预配置：TMOS 的 net self / VLAN 对象不在首批范围，
+    // 这里等价于「属性面板」设置 LB 三个接口地址，不属于课程 tmsh CLI 任务。
+    sim.set_port_ip(lb, 0, '10.0.0.1', 24);
+    sim.set_port_ip(lb, 1, '10.0.1.1', 24);
+    sim.set_port_ip(lb, 2, '10.0.2.1', 24);
     setPosition(pc1, { x: 60, y: 90 });
     setPosition(lb, { x: 300, y: 90 });
     setPosition(s1, { x: 560, y: 30 });
@@ -1502,8 +1347,8 @@ export const lab23: LabDef = {
     'Underlay：DSW1 vlan 100 → vlanif100 10.0.0.1/24 接 SPINE G0/0/0 10.0.0.2/24；DSW2 vlan 100 → vlanif100 10.0.1.2/24 接 SPINE G0/0/1 10.0.1.1/24；DSW3 vlan 100 → vlanif100 10.0.2.2/24 接 SPINE G0/0/2 10.0.2.1/24（均 undo shutdown）',
     'Underlay 路由：DSW1 ip route-static 10.0.1.0 24 与 10.0.2.0 24 均走 10.0.0.2；DSW2 两条均走 10.0.1.1；DSW3 两条均走 10.0.2.1。SPINE 只有三条直连——零额外配置',
     'VXLAN：DSW1 vxlan local 10.0.0.1 → vni 10000 vlan 10 → vxlan peer 10.0.2.2；DSW2 local 10.0.1.2 → peer 10.0.2.2；DSW3 local 10.0.2.2 → peer 10.0.0.1 → peer 10.0.1.2（DSW3 需要 peers 双条）',
-    '应用交付：F5 G0/0/0 192.168.10.254/24 接 DSW3（access VLAN10）→ G0/0/1 10.10.1.1/24 接 SRV1 → G0/0/2 10.10.2.1/24 接 SRV2；ltm pool WEB member 10.10.1.10 80 与 10.10.2.10 80；ltm virtual VS vip 192.168.10.100 80 pool WEB',
-    '验证：从 DSW1 ping 10.0.2.2 应通（Underlay 跨 SPINE）；APP1 tcp 192.168.10.100 80 连续两次都成功（F5 轮询到不同成员）；display ltm 应看到两条会话',
+    '应用交付：F5 G0/0/0 192.168.10.254/24 接 DSW3（access VLAN10）→ G0/0/1 10.10.1.1/24 接 SRV1 → G0/0/2 10.10.2.1/24 接 SRV2；F5（tmsh）：ltm → create pool WEB → modify pool WEB members add { 10.10.1.10:80 } → modify pool WEB members add { 10.10.2.10:80 } → create virtual VS destination 192.168.10.100:80 pool WEB → exit',
+    '验证：从 DSW1 ping 10.0.2.2 应通（Underlay 跨 SPINE）；APP1 tcp 192.168.10.100 80 连续两次都成功（F5 轮询到不同成员）；F5 的 show ltm pool 应看到会话分布',
   ],
   checks: [
     { label: 'DSW1 配置 M-LAG domain 1', kind: { type: 'mlagDomain', dev: 'DSW1', domain: 1 } },
@@ -1522,7 +1367,7 @@ export const lab23: LabDef = {
     const d2 = sim.add_device('Switch', 'Vrp');
     const spine = sim.add_device('Router', 'Vrp');
     const d3 = sim.add_device('Switch', 'Vrp');
-    const f5 = sim.add_device('LoadBalancer', 'Vrp');
+    const f5 = sim.add_device('LoadBalancer', 'Tmos');
     const srv1 = sim.add_device('Host', 'Ios');
     const srv2 = sim.add_device('Host', 'Ios');
     sim.rename_device(app1, 'APP1');
@@ -1550,6 +1395,11 @@ export const lab23: LabDef = {
     sim.set_host_config(app2, '192.168.10.12', 24, '');
     sim.set_host_config(srv1, '10.10.1.10', 24, '10.10.1.1');
     sim.set_host_config(srv2, '10.10.2.10', 24, '10.10.2.1');
+    // F5 已改为独立 Tmos 方言；net self / VLAN 对象不在首批范围，
+    // 接口地址作为实验拓扑预配置，学生的 CLI 任务只含 tmsh LTM 命令。
+    sim.set_port_ip(f5, 0, '192.168.10.254', 24);
+    sim.set_port_ip(f5, 1, '10.10.1.1', 24);
+    sim.set_port_ip(f5, 2, '10.10.2.1', 24);
     setPosition(app1, { x: 50, y: 40 });
     setPosition(app2, { x: 50, y: 200 });
     setPosition(sw1, { x: 220, y: 120 });

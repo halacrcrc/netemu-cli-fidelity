@@ -7,6 +7,16 @@ use crate::cmd;
 use crate::Trees;
 
 fn h_enable(c: &mut Ctx) -> Result<String, CliError> {
+    let secret_set = c
+        .eng
+        .net
+        .device(c.dev)
+        .map(|d| d.mgmt.enable_secret.is_some())
+        .unwrap_or(false);
+    if secret_set {
+        c.sess.enable_prompt = true;
+        return Ok(String::new());
+    }
     c.sess.mode = Mode::Priv;
     c.sess.sub = Default::default();
     Ok(String::new())
@@ -31,7 +41,8 @@ fn h_end(c: &mut Ctx) -> Result<String, CliError> {
 }
 
 fn h_exit(c: &mut Ctx) -> Result<String, CliError> {
-    c.sess.mode = match c.sess.mode {
+    let previous = c.sess.mode;
+    c.sess.mode = match previous {
         Mode::If => Mode::Config,
         Mode::Config => Mode::Priv,
         Mode::Pool
@@ -48,12 +59,24 @@ fn h_exit(c: &mut Ctx) -> Result<String, CliError> {
         | Mode::SecurityPolicy
         | Mode::SecurityRule
         | Mode::Ipsec
-        | Mode::Ospfv3 => Mode::Config,
+        | Mode::Ospfv3
+        | Mode::Vlan
+        | Mode::ClassMap
+        | Mode::PolicyMap => Mode::Config,
+        Mode::PolicyMapClass => Mode::PolicyMap,
         _ => Mode::Exec,
     };
     if c.sess.mode != Mode::If {
         c.sess.cur_if = None;
-        c.sess.sub = Default::default();
+        // 阶段 6B：`config-pmap-c` 只退一级到 `config-pmap`，必须保留策略名；
+        // 其余退出（到 config 或特权）清空子上下文。
+        if previous == Mode::PolicyMapClass && c.sess.mode == Mode::PolicyMap {
+            c.sess.sub.pmap_class = None;
+            c.sess.sub.cmap = None;
+            c.sess.sub.rule = None;
+        } else {
+            c.sess.sub = Default::default();
+        }
     }
     Ok(String::new())
 }
@@ -86,6 +109,41 @@ fn acl_action_branch() -> CNode {
         .kid(acl_src_branch(cmd::ios_access_list))
         .kid(CNode::lit("icmp", "ICMP protocol").kid(acl_src_branch(cmd::ios_access_list_icmp)))
         .kid(CNode::lit("ip", "Any IP protocol").kid(acl_src_branch(cmd::ios_access_list)))
+        // Stage 2B / C5：TCP 规则，端口槽 `eq <port>` 参与规则匹配。
+        .kid(
+            CNode::lit("tcp", "TCP protocol").kid(
+                CNode::param(ParamKind::Ipv4, "src", "Source address").kid(
+                    CNode::param(ParamKind::Wildcard, "src_wildcard", "Source wildcard bits")
+                        .run(cmd::ios_access_list_tcp)
+                        .kid(
+                            CNode::lit("eq", "Source port equals").kid(
+                                CNode::param(ParamKind::Number, "sport", "Source port")
+                                    .run(cmd::ios_access_list_tcp),
+                            ),
+                        )
+                        .kid(
+                            CNode::param(ParamKind::Ipv4, "dst", "Destination address").kid(
+                                CNode::param(
+                                    ParamKind::Wildcard,
+                                    "dst_wildcard",
+                                    "Destination wildcard bits",
+                                )
+                                .run(cmd::ios_access_list_tcp)
+                                .kid(
+                                    CNode::lit("eq", "Destination port equals").kid(
+                                        CNode::param(
+                                            ParamKind::Number,
+                                            "dport",
+                                            "Destination port",
+                                        )
+                                        .run(cmd::ios_access_list_tcp),
+                                    ),
+                                ),
+                            ),
+                        ),
+                ),
+            ),
+        )
 }
 
 fn h_no_shutdown(c: &mut Ctx) -> Result<String, CliError> {
@@ -138,12 +196,17 @@ fn show_branch() -> CNode {
                         .run(cmd::show_nat),
                 )
                 .kid(
-                    CNode::lit("dhcp", "DHCP information").kid(
-                        CNode::lit("snooping", "DHCP snooping").kid(
-                            CNode::lit("binding", "Snooping binding table")
-                                .run(cmd::show_dhcp_snooping),
+                    CNode::lit("dhcp", "DHCP information")
+                        .kid(
+                            CNode::lit("binding", "Server lease bindings")
+                                .run(cmd::show_dhcp_binding),
+                        )
+                        .kid(
+                            CNode::lit("snooping", "DHCP snooping").kid(
+                                CNode::lit("binding", "Snooping binding table")
+                                    .run(cmd::show_dhcp_snooping),
+                            ),
                         ),
-                    ),
                 )
                 .kid(
                     CNode::lit("bgp", "BGP information")
@@ -177,7 +240,7 @@ fn show_branch() -> CNode {
         )
         .kid(
             CNode::lit("zone-pair", "Zone pairs").kid(
-                CNode::lit("security", "Show zone-pair policies").run(cmd::show_security_policy),
+                CNode::lit("security", "Show zone-pair policies").run(cmd::show_zbf_zone_pairs),
             ),
         )
         .kid(
@@ -193,7 +256,6 @@ fn show_branch() -> CNode {
         .kid(CNode::lit("evpn", "EVPN information").run(cmd::show_evpn))
         .kid(CNode::lit("stack", "Stack information").run(cmd::show_stack))
         .kid(CNode::lit("mlag", "M-LAG information").run(cmd::show_mlag))
-        .kid(CNode::lit("ltm", "LTM information").run(cmd::show_ltm))
         .kid(CNode::lit("spanning-tree", "Spanning tree topology").run(cmd::show_stp))
         .kid(CNode::lit("vrrp", "VRRP status").run(cmd::show_vrrp))
         .kid(CNode::lit("port-security", "Port security").run(cmd::show_port_security))
@@ -221,6 +283,39 @@ fn show_branch() -> CNode {
         .kid(
             CNode::lit("etherchannel", "EtherChannel information").kid(
                 CNode::lit("summary", "One-line summary per channel-group").run(cmd::show_lag),
+            ),
+        )
+        // 阶段 6B：真实 IOS XE 17.x ZBF 查询命令（官方全文证据见 specs.rs）。
+        .kid(
+            CNode::lit("policy-map", "Inspect policy maps").kid(
+                CNode::lit("type", "Policy map type").kid(
+                    CNode::lit("inspect", "Inspect type policy map").kid(
+                        CNode::lit("zone-pair", "Zone-pair inspect policy")
+                            .run(cmd::show_zbf_policy_map)
+                            .kid(
+                                CNode::opt_param(ParamKind::Word, "zp", "Zone-pair name")
+                                    // O-1：官方 Cisco 设计指南语法为
+                                    // `[zone-pair-name] [sessions]`，组合形式受支持；
+                                    // E1 任务步骤使用单数 `session`，两种写法都接受。
+                                    .kid(
+                                        CNode::lit("session", "Inspect sessions")
+                                            .run(cmd::show_zbf_policy_map_session),
+                                    )
+                                    .kid(
+                                        CNode::lit("sessions", "Inspect sessions")
+                                            .run(cmd::show_zbf_policy_map_session),
+                                    ),
+                            )
+                            .kid(
+                                CNode::lit("session", "Inspect sessions")
+                                    .run(cmd::show_zbf_policy_map_session),
+                            )
+                            .kid(
+                                CNode::lit("sessions", "Inspect sessions")
+                                    .run(cmd::show_zbf_policy_map_session),
+                            ),
+                    ),
+                ),
             ),
         )
 }
@@ -398,12 +493,61 @@ pub fn build() -> Trees {
                         .run(cmd::security_zone_enter),
                 ),
             ),
+            // 阶段 6B：真实 IOS XE 17.x ZBF zone-pair。
+            // 官方语法要求同时给出 source 与 destination；仅输入名字是
+            // `% Incomplete command`，不再提供 Stage 3B 的简化 zone-pair 模式。
             CNode::lit("zone-pair", "Zone pair").kid(
                 CNode::lit("security", "Zone pair name").kid(
-                    CNode::param(ParamKind::Word, "name", "Zone pair name")
-                        .run(cmd::security_rule_enter),
+                    CNode::param(ParamKind::Word, "name", "Zone pair name").kid(
+                        CNode::lit("source", "Source security zone").kid(
+                            CNode::param(ParamKind::Word, "src", "Source zone name").kid(
+                                CNode::lit("destination", "Destination security zone").kid(
+                                    CNode::param(ParamKind::Word, "dst", "Destination zone name")
+                                        .run(cmd::zbf_zone_pair_enter),
+                                ),
+                            ),
+                        ),
+                    ),
                 ),
             ),
+            // 阶段 6B：真实 IOS XE 17.x ZBF class-map / policy-map。
+            CNode::lit("class-map", "Class map").kid(
+                CNode::lit("type", "Class map type").kid(
+                    CNode::lit("inspect", "Inspect type class map")
+                        .kid(
+                            CNode::lit("match-any", "Match any criterion").kid(
+                                CNode::param(ParamKind::Word, "name", "Class map name")
+                                    .run(cmd::zbf_class_map_enter_any),
+                            ),
+                        )
+                        .kid(
+                            CNode::lit("match-all", "Match all criteria").kid(
+                                CNode::param(ParamKind::Word, "name", "Class map name")
+                                    .run(cmd::zbf_class_map_enter_all),
+                            ),
+                        ),
+                ),
+            ),
+            CNode::lit("policy-map", "Policy map").kid(
+                CNode::lit("type", "Policy map type").kid(
+                    CNode::lit("inspect", "Inspect type policy map").kid(
+                        CNode::param(ParamKind::Word, "name", "Policy map name")
+                            .run(cmd::zbf_policy_map_enter),
+                    ),
+                ),
+            ),
+            // 官方 `parameter-map type inspect` 属本包边界：语法登记为未模拟。
+            CNode::lit("parameter-map", "Parameter map").kid(
+                CNode::lit("type", "Parameter map type").kid(
+                    CNode::lit("inspect", "Inspect parameter map").kid(
+                        CNode::param(ParamKind::Word, "name", "Parameter map name")
+                            .run(cmd::zbf_recognized_only),
+                    ),
+                ),
+            ),
+            // 阶段 6B：ZBF 对象的否定形式追加到既有的全局 `no` 节点
+            // （官方 `no zone security`、`no drop log` 正文示例；其余按
+            // IOS 通用 `no <command>` 形式实现）。
             CNode::lit("ipsec", "IPsec configuration").kid(
                 CNode::lit("tunnel", "Static site-to-site tunnel").kid(
                     CNode::param(ParamKind::Word, "name", "Tunnel name").kid(
@@ -482,35 +626,8 @@ pub fn build() -> Trees {
                     CNode::lit("peer", "EVPN peer")
                         .kid(CNode::param(ParamKind::Ipv4, "ip", "Peer VTEP").run(cmd::evpn_peer)),
                 ),
-            CNode::lit("ltm", "Local Traffic Manager")
-                .kid(
-                    CNode::lit("pool", "Server pool").kid(
-                        CNode::param(ParamKind::Word, "pool", "Pool name").kid(
-                            CNode::lit("member", "Pool member").kid(
-                                CNode::param(ParamKind::Ipv4, "ip", "Member IP").kid(
-                                    CNode::param(ParamKind::Number, "port", "Service port")
-                                        .run(cmd::ltm_pool_member),
-                                ),
-                            ),
-                        ),
-                    ),
-                )
-                .kid(
-                    CNode::lit("virtual", "Virtual server").kid(
-                        CNode::param(ParamKind::Word, "name", "Virtual name").kid(
-                            CNode::lit("vip", "Virtual IP").kid(
-                                CNode::param(ParamKind::Ipv4, "vip", "VIP address").kid(
-                                    CNode::param(ParamKind::Number, "port", "Service port").kid(
-                                        CNode::lit("pool", "Pool name").kid(
-                                            CNode::param(ParamKind::Word, "pool", "Pool name")
-                                                .run(cmd::ltm_virtual),
-                                        ),
-                                    ),
-                                ),
-                            ),
-                        ),
-                    ),
-                ),
+            // 阶段 5A：抽象 `ltm` 命令已移除。LTM 只属于独立 Dialect::Tmos / tmsh，
+            // 不再伪装成 IOS 命令（主方案 §4.3 P0 / §13）。
             CNode::lit("stack", "Stack/IRF configuration")
                 .kid(CNode::lit("domain", "Stack domain").kid(
                     CNode::param(ParamKind::Number, "domain", "Domain ID").run(cmd::stack_domain),
@@ -671,6 +788,15 @@ pub fn build() -> Trees {
                             CNode::lit("pool", "Configure a DHCP address pool")
                                 .kid(CNode::param(ParamKind::Word, "name", "Name of the pool"))
                                 .run(cmd::dhcp_pool_enter),
+                        )
+                        .kid(
+                            CNode::lit("excluded-address", "Exclude addresses from allocation")
+                                .kid(
+                                    CNode::param(ParamKind::Ipv4, "low", "First address").kid(
+                                        CNode::param(ParamKind::Ipv4, "high", "Last address")
+                                            .run(cmd::dhcp_exclude),
+                                    ),
+                                ),
                         ),
                 )
                 .kid(
@@ -702,7 +828,14 @@ pub fn build() -> Trees {
                                                             "if",
                                                             "Outside interface",
                                                         )
-                                                        .run(cmd::nat_easyip_ios),
+                                                        .run(cmd::nat_easyip_ios)
+                                                        .kid(
+                                                            CNode::lit(
+                                                                "overload",
+                                                                "Enable PAT overload",
+                                                            )
+                                                            .run(cmd::nat_easyip_ios),
+                                                        ),
                                                     ),
                                                 ),
                                             ),
@@ -780,14 +913,200 @@ pub fn build() -> Trees {
                         ),
                     ),
                 ),
-            CNode::lit("no", "Negate a command or set its defaults").kid(
-                CNode::lit("spanning-tree", "Disable spanning tree").kid(
-                    CNode::lit("vlan", "VLAN spanning tree configuration").kid(
-                        CNode::param(ParamKind::Number, "vlan", "VLAN ID, 1-4094")
-                            .run(|c| cmd::stp_enable(c, false)),
+            CNode::lit("no", "Negate a command or set its defaults")
+                .kid(
+                    CNode::lit("zone", "Security zone").kid(
+                        CNode::lit("security", "Security zone name").kid(
+                            CNode::param(ParamKind::Word, "name", "Zone name")
+                                .run(cmd::security_zone_delete),
+                        ),
                     ),
-                ),
-            ),
+                )
+                .kid(
+                    CNode::lit("zone-pair", "Zone pair").kid(
+                        CNode::lit("security", "Zone pair name").kid(
+                            CNode::param(ParamKind::Word, "name", "Zone pair name")
+                                .run(cmd::zbf_no_zone_pair),
+                        ),
+                    ),
+                )
+                .kid(
+                    CNode::lit("class-map", "Class map")
+                        .kid(
+                            CNode::param(ParamKind::Word, "name", "Class map name")
+                                .run(cmd::zbf_no_class_map),
+                        )
+                        .kid(
+                            CNode::lit("type", "Class map type").kid(
+                                CNode::lit("inspect", "Inspect type class map")
+                                    .kid(
+                                        CNode::lit("match-any", "Match any criterion").kid(
+                                            CNode::param(
+                                                ParamKind::Word,
+                                                "name",
+                                                "Class map name",
+                                            )
+                                            .run(cmd::zbf_no_class_map),
+                                        ),
+                                    )
+                                    .kid(
+                                        CNode::lit("match-all", "Match all criteria").kid(
+                                            CNode::param(
+                                                ParamKind::Word,
+                                                "name",
+                                                "Class map name",
+                                            )
+                                            .run(cmd::zbf_no_class_map),
+                                        ),
+                                    ),
+                            ),
+                        ),
+                )
+                .kid(
+                    CNode::lit("policy-map", "Policy map")
+                        .kid(
+                            CNode::param(ParamKind::Word, "name", "Policy map name")
+                                .run(cmd::zbf_no_policy_map),
+                        )
+                        .kid(
+                            CNode::lit("type", "Policy map type").kid(
+                                CNode::lit("inspect", "Inspect type policy map").kid(
+                                    CNode::param(ParamKind::Word, "name", "Policy map name")
+                                        .run(cmd::zbf_no_policy_map),
+                                ),
+                            ),
+                        ),
+                )
+                .kid(
+                    CNode::lit("spanning-tree", "Disable spanning tree").kid(
+                        CNode::lit("vlan", "VLAN spanning tree configuration").kid(
+                            CNode::param(ParamKind::Number, "vlan", "VLAN ID, 1-4094")
+                                .run(|c| cmd::stp_enable(c, false)),
+                        ),
+                    ),
+                )
+                .kid(
+                    CNode::lit("ip", "IP information")
+                        .kid(
+                            CNode::lit("route", "Delete a static route")
+                                .run(cmd::no_static_route)
+                                .kid(
+                                    CNode::param(ParamKind::Ipv4, "dst", "Destination prefix").kid(
+                                        CNode::param(
+                                            ParamKind::DottedMask,
+                                            "mask",
+                                            "Destination mask",
+                                        )
+                                        .kid(CNode::param(
+                                            ParamKind::Ipv4,
+                                            "nexthop",
+                                            "Next-hop IP address",
+                                        )),
+                                    ),
+                                ),
+                        )
+                        .kid(
+                            CNode::lit("dhcp", "DHCP negation")
+                                .kid(
+                                    CNode::lit("pool", "Delete a DHCP address pool").kid(
+                                        CNode::param(ParamKind::Word, "name", "Pool name")
+                                            .run(cmd::dhcp_pool_remove),
+                                    ),
+                                )
+                                .kid(
+                                    CNode::lit("excluded-address", "Remove an excluded range").kid(
+                                        CNode::param(ParamKind::Ipv4, "low", "First address").kid(
+                                            CNode::param(ParamKind::Ipv4, "high", "Last address")
+                                                .run(cmd::dhcp_no_exclude),
+                                        ),
+                                    ),
+                                ),
+                        )
+                        .kid(
+                            CNode::lit("nat", "NAT negation").kid(
+                                CNode::lit("inside", "Remove an inside NAT binding").kid(
+                                    CNode::lit("source", "Source translation")
+                                        .kid(
+                                            CNode::lit("static", "Delete a static mapping").kid(
+                                                CNode::param(
+                                                    ParamKind::Ipv4,
+                                                    "inside",
+                                                    "Inside local address",
+                                                )
+                                                .kid(
+                                                    CNode::param(
+                                                        ParamKind::Ipv4,
+                                                        "outside",
+                                                        "Inside global address",
+                                                    )
+                                                    .run(cmd::nat_no_static),
+                                                ),
+                                            ),
+                                        )
+                                        .kid(
+                                            CNode::lit("list", "Remove an EasyIP overload rule")
+                                                .kid(
+                                                    CNode::param(
+                                                        ParamKind::Number,
+                                                        "acl",
+                                                        "ACL number",
+                                                    )
+                                                    .kid(
+                                                        CNode::lit(
+                                                            "interface",
+                                                            "Outside interface",
+                                                        )
+                                                        .kid(
+                                                            CNode::param(
+                                                                ParamKind::IfName,
+                                                                "if",
+                                                                "Outside interface",
+                                                            )
+                                                            .run(cmd::nat_no_easyip)
+                                                            .kid(
+                                                                CNode::lit(
+                                                                    "overload",
+                                                                    "PAT overload keyword",
+                                                                )
+                                                                .run(cmd::nat_no_easyip),
+                                                            ),
+                                                        ),
+                                                    ),
+                                                ),
+                                        ),
+                                ),
+                            ),
+                        ),
+                )
+                .kid(
+                    CNode::lit("access-list", "Delete an ACL or one of its rules").kid(
+                        CNode::param(ParamKind::Number, "number", "ACL number")
+                            .run(cmd::acl_no_all)
+                            .kid(
+                                CNode::lit("rule", "Delete a single rule by index").kid(
+                                    CNode::param(ParamKind::Number, "seq", "1-based rule index")
+                                        .run(cmd::acl_no_rule),
+                                ),
+                            ),
+                    ),
+                )
+                .kid(
+                    CNode::lit("router", "Remove a routing process").kid(
+                        CNode::lit("ospf", "Remove the OSPF process").kid(
+                            CNode::param(ParamKind::Number, "process", "OSPF process id")
+                                .run(cmd::ospf_no_process),
+                        ),
+                    ),
+                )
+                .kid(
+                    CNode::lit("enable", "Negate privileged settings").kid(
+                        CNode::lit("secret", "Remove the enable secret")
+                            .run(cmd::mgmt_no_enable_secret),
+                    ),
+                )
+                .kid(CNode::lit("username", "Delete a local user").kid(
+                    CNode::param(ParamKind::Word, "name", "User name").run(cmd::mgmt_no_username),
+                )),
             CNode::lit("exit", "Exit from configuration mode").run(h_exit),
             CNode::lit("end", "Exit to privileged mode").run(h_end),
         ],
@@ -850,11 +1169,9 @@ pub fn build() -> Trees {
                         .run(cmd::security_zone_member),
                 ),
             ),
-            CNode::lit("nameif", "Assign an ASA interface name").kid(
-                CNode::param(ParamKind::Word, "name", "e.g. inside, outside").run(cmd::nameif),
-            ),
-            CNode::lit("security-level", "Set the ASA security level")
-                .kid(CNode::param(ParamKind::Number, "level", "0-100").run(cmd::security_level)),
+            // 阶段 6A：ASA 血统的 `nameif` / `security-level` 已从命令树移除。
+            // 基线选择华为 VRP 安全策略后，ASA 的安全级别回退语义不再有数据面；
+            // 该血统降级为教学抽象（讲义对照说明），不保留同名 CLI 入口。
             // 交换机二层口命令
             CNode::lit("ipv6", "IPv6 interface configuration")
                 .kid(
@@ -886,7 +1203,7 @@ pub fn build() -> Trees {
                         )
                         .kid(
                             CNode::lit("trunk", "Set trunk mode (tagged, multiple VLANs)")
-                                .run(cmd::sw_mode_trunk),
+                                .run(cmd::enter_trunk),
                         ),
                 )
                 .kid(
@@ -991,13 +1308,57 @@ pub fn build() -> Trees {
             CNode::lit("no", "Negate a command or set its defaults")
                 .kid(CNode::lit("shutdown", "Undo shutdown of the interface").run(h_no_shutdown))
                 .kid(
-                    CNode::lit("ip", "IP information").kid(
-                        CNode::lit("address", "Remove the IP address").run(cmd::no_ip_address),
+                    CNode::lit("zone-member", "Remove this interface from a security zone").kid(
+                        CNode::lit("security", "Security zone").kid(
+                            CNode::param(ParamKind::Word, "zone", "Zone name")
+                                .run(cmd::security_zone_member_delete),
+                        ),
+                    ),
+                )
+                .kid(
+                    CNode::lit("ip", "IP information")
+                        .kid(CNode::lit("address", "Remove the IP address").run(cmd::no_ip_address))
+                        .kid(
+                            CNode::lit("nat", "Remove the NAT interface role")
+                                .kid(
+                                    CNode::lit("inside", "Remove ip nat inside")
+                                        .run(cmd::nat_no_inside),
+                                )
+                                .kid(
+                                    CNode::lit("outside", "Remove ip nat outside")
+                                        .run(cmd::nat_no_outside),
+                                ),
+                        )
+                        .kid(
+                            CNode::lit("access-group", "Remove the ACL binding").kid(
+                                CNode::param(ParamKind::Number, "number", "ACL number").kid(
+                                    CNode::param(ParamKind::Word, "dir", "in | out")
+                                        .run(cmd::acl_no_bind),
+                                ),
+                            ),
+                        ),
+                )
+                .kid(
+                    CNode::lit("switchport", "Negate switching characteristics").kid(
+                        CNode::lit("access", "Reset access VLAN").kid(
+                            CNode::lit("vlan", "Reset access VLAN to default")
+                                .run(cmd::no_access_vlan),
+                        ),
                     ),
                 )
                 .kid(
                     CNode::lit("channel-group", "Leave the EtherChannel group")
                         .run(cmd::lag_unbind),
+                )
+                .kid(
+                    CNode::lit("vrrp", "Remove a VRRP group").kid(
+                        CNode::param(ParamKind::Number, "vrid", "VRRP group id")
+                            .run(cmd::vrrp_no_group)
+                            .kid(
+                                CNode::lit("preempt", "Disable VRRP preemption")
+                                    .run(cmd::vrrp_no_preempt),
+                            ),
+                    ),
                 ),
             CNode::lit("shutdown", "Shut down the interface").run(h_shutdown),
             CNode::lit("exit", "Exit from interface configuration mode").run(h_exit),
@@ -1016,13 +1377,26 @@ pub fn build() -> Trees {
                 .kid(CNode::param(ParamKind::Ipv4, "gw", "Gateway address").run(cmd::pool_gateway)),
             CNode::lit("dns-server", "Configure the DNS server")
                 .kid(CNode::param(ParamKind::Ipv4, "dns", "DNS server address").run(cmd::pool_dns)),
+            CNode::lit("no", "Negate a pool setting")
+                .kid(CNode::lit("network", "Remove the pool network").run(cmd::pool_no_network))
+                .kid(
+                    CNode::lit("default-router", "Remove the default gateway")
+                        .run(cmd::pool_no_gateway),
+                )
+                .kid(CNode::lit("dns-server", "Remove the DNS server").run(cmd::pool_no_dns)),
             CNode::lit("exit", "Exit from DHCP pool configuration mode").run(h_exit),
         ],
         acl: vec![CNode::lit("exit", "Exit from ACL configuration mode").run(h_exit)],
         line: vec![
-            CNode::lit("login", "Enable login authentication")
-                .run(cmd::mgmt_login_local)
+            CNode::lit("login", "Enable line-password login authentication")
+                .run(cmd::mgmt_login_line)
                 .kid(CNode::lit("local", "Use the local user database").run(cmd::mgmt_login_local)),
+            CNode::lit("password", "Set the line password").kid(
+                CNode::param(ParamKind::Word, "secret", "Line password")
+                    .run(cmd::mgmt_line_password),
+            ),
+            CNode::lit("no", "Negate a line command")
+                .kid(CNode::lit("login", "Disable line authentication").run(cmd::mgmt_no_login)),
             CNode::lit("transport", "Line transport settings").kid(
                 CNode::lit("input", "Allowed inbound protocols").kid(
                     CNode::param(ParamKind::WordList, "protos", "ssh | telnet | all | none")
@@ -1059,6 +1433,19 @@ pub fn build() -> Trees {
                     ),
                 ),
             ),
+            // Stage 2B / C7：撤销单条 network 语句，配置、邻居、路由与数据面同步。
+            CNode::lit("no", "Negate an OSPF network statement").kid(
+                CNode::lit("network", "Remove a network statement").kid(
+                    CNode::param(ParamKind::Ipv4, "net", "Network address").kid(
+                        CNode::param(ParamKind::Wildcard, "wildcard", "Wildcard bits").kid(
+                            CNode::lit("area", "OSPF area").kid(
+                                CNode::param(ParamKind::Number, "area", "Area ID")
+                                    .run(cmd::ospf_no_network_ios),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
             CNode::lit("exit", "Exit from router configuration mode").run(h_exit),
             CNode::lit("end", "Exit to privileged mode").run(h_end),
         ],
@@ -1072,6 +1459,14 @@ pub fn build() -> Trees {
             CNode::lit("exit", "Exit from router configuration mode").run(h_exit),
             CNode::lit("end", "Exit to privileged mode").run(h_end),
         ],
+        // IOS 的 `vlan <id>` 不切换模式；最小退出集合仅作兜底。
+        vlan: vec![
+            CNode::lit("exit", "Exit from VLAN configuration mode").run(h_exit),
+            CNode::lit("end", "Exit to privileged mode").run(h_end),
+        ],
+        // 阶段 5A：tmsh 模块只属于独立 Tmos 树，IOS 树不承载任何 tmsh 节点。
+        tmos_ltm: vec![],
+        tmos_sys: vec![],
         bgp: vec![
             CNode::lit("neighbor", "Configure a BGP neighbor").kid(
                 CNode::param(ParamKind::Ipv4, "ip", "Neighbor IP address")
@@ -1138,18 +1533,147 @@ pub fn build() -> Trees {
             CNode::lit("end", "Exit to privileged mode").run(h_end),
         ],
         security_rule: vec![
-            CNode::lit("source", "Source zone").kid(
-                CNode::param(ParamKind::Word, "src", "Source zone name")
-                    .run(cmd::security_rule_source),
+            // 阶段 6B：官方 `config-sec-zone-pair` 模式（提示符逐字保真）。
+            CNode::lit("service-policy", "Attach an inspect policy map").kid(
+                CNode::lit("type", "Service policy type").kid(
+                    CNode::lit("inspect", "Inspect type service policy").kid(
+                        CNode::param(ParamKind::Word, "policy", "Policy map name")
+                            .run(cmd::zbf_zone_pair_service_policy),
+                    ),
+                ),
             ),
-            CNode::lit("destination", "Destination zone").kid(
-                CNode::param(ParamKind::Word, "dst", "Destination zone name")
-                    .run(cmd::security_rule_destination),
+            CNode::lit("no", "Negate a command or set its defaults").kid(
+                CNode::lit("service-policy", "Detach an inspect policy map").kid(
+                    CNode::lit("type", "Service policy type").kid(
+                        CNode::lit("inspect", "Inspect type service policy").kid(
+                            CNode::param(ParamKind::Word, "policy", "Policy map name")
+                                .run(cmd::zbf_zone_pair_no_service_policy),
+                        ),
+                    ),
+                ),
             ),
-            CNode::lit("action", "Policy action").kid(
-                CNode::param(ParamKind::Word, "action", "permit | deny").run(cmd::security_action),
+            // 官方任务步骤中的邻接命令：已识别但未模拟，不冒充成功。
+            CNode::lit("description", "Zone-pair description").kid(
+                CNode::param(ParamKind::WordList, "text", "Description text")
+                    .run(cmd::zbf_recognized_only),
+            ),
+            CNode::lit("platform", "Platform settings").kid(
+                CNode::lit("inspect", "Inspect settings").kid(
+                    CNode::lit("match-statistics", "Match statistics").kid(
+                        CNode::lit("per-filter", "Per-filter statistics")
+                            .run(cmd::zbf_recognized_only),
+                    ),
+                ),
             ),
             CNode::lit("exit", "Exit from zone-pair mode").run(h_exit),
+            CNode::lit("end", "Exit to privileged mode").run(h_end),
+        ],
+        // 阶段 6B：`class-map type inspect` 子模式 `(config-cmap)#`。
+        class_map: vec![
+            CNode::lit("match", "Configure match criteria")
+                .kid(
+                    CNode::lit("protocol", "Match a protocol").kid(
+                        CNode::param(ParamKind::Word, "proto", "Protocol name")
+                            .run(cmd::zbf_cmap_match_protocol),
+                    ),
+                )
+                .kid(
+                    CNode::lit("access-group", "Match an access list").kid(
+                        CNode::param(ParamKind::Number, "acl", "Access list number")
+                            .run(cmd::zbf_cmap_match_access_group),
+                    ),
+                )
+                // 嵌套 class-map 属本包边界：语法登记为未模拟。
+                .kid(
+                    CNode::lit("class-map", "Match a class map").kid(
+                        CNode::param(ParamKind::Word, "name", "Class map name")
+                            .run(cmd::zbf_recognized_only),
+                    ),
+                ),
+            CNode::lit("no", "Negate a command or set its defaults")
+                .kid(
+                    CNode::lit("match", "Negate match criteria")
+                        .kid(
+                            CNode::lit("protocol", "Match a protocol").kid(
+                                CNode::param(ParamKind::Word, "proto", "Protocol name")
+                                    .run(cmd::zbf_cmap_no_match_protocol),
+                            ),
+                        )
+                        .kid(
+                            CNode::lit("access-group", "Match an access list").kid(
+                                CNode::param(ParamKind::Number, "acl", "Access list number")
+                                    .run(cmd::zbf_cmap_no_match_access_group),
+                            ),
+                        ),
+                ),
+            CNode::lit("exit", "Exit from class-map mode").run(h_exit),
+            CNode::lit("end", "Exit to privileged mode").run(h_end),
+        ],
+        // 阶段 6B：`policy-map type inspect` 子模式 `(config-pmap)#`。
+        policy_map: vec![
+            CNode::lit("class", "Configure a policy class")
+                .kid(
+                    CNode::lit("type", "Class type").kid(
+                        CNode::lit("inspect", "Inspect class").kid(
+                            CNode::param(ParamKind::Word, "name", "Class map name")
+                                .run(cmd::zbf_pmap_class),
+                        ),
+                    ),
+                )
+                .kid(
+                    CNode::lit("class-default", "System default class")
+                        .run(cmd::zbf_pmap_class_default),
+                ),
+            CNode::lit("no", "Negate a command or set its defaults").kid(
+                CNode::lit("class", "Remove a policy class")
+                    .kid(
+                        CNode::lit("type", "Class type").kid(
+                            CNode::lit("inspect", "Inspect class").kid(
+                                CNode::param(ParamKind::Word, "name", "Class map name")
+                                    .run(cmd::zbf_pmap_no_class),
+                            ),
+                        ),
+                    )
+                    .kid(
+                        CNode::lit("class-default", "System default class")
+                            .run(cmd::zbf_pmap_no_class_default),
+                    ),
+            ),
+            CNode::lit("exit", "Exit from policy-map mode").run(h_exit),
+            CNode::lit("end", "Exit to privileged mode").run(h_end),
+        ],
+        // 阶段 6B：`policy-map` class 子模式 `(config-pmap-c)#`。
+        policy_map_class: vec![
+            CNode::lit("inspect", "Enable stateful inspection")
+                .run(cmd::zbf_action_inspect)
+                .kid(
+                    CNode::opt_param(ParamKind::Word, "param", "Parameter map name"),
+                ),
+            CNode::lit("pass", "Allow without inspection").run(cmd::zbf_action_pass),
+            CNode::lit("drop", "Drop matched traffic")
+                .run(cmd::zbf_action_drop)
+                .kid(CNode::lit("log", "Log dropped packets").run(cmd::zbf_action_drop_log)),
+            CNode::lit("no", "Negate a command or set its defaults")
+                .kid(CNode::lit("inspect", "Remove inspect action").run(cmd::zbf_action_no_inspect))
+                .kid(CNode::lit("pass", "Remove pass action").run(cmd::zbf_action_no_pass))
+                .kid(
+                    CNode::lit("drop", "Remove drop action")
+                        .run(cmd::zbf_action_no_drop)
+                        .kid(
+                            CNode::lit("log", "Disable drop logging")
+                                .run(cmd::zbf_action_no_drop_log),
+                        ),
+                ),
+            // 官方允许在 class 内嵌套 service-policy；层次化策略不在本包范围。
+            CNode::lit("service-policy", "Nested inspect policy").kid(
+                CNode::lit("type", "Service policy type").kid(
+                    CNode::lit("inspect", "Inspect type service policy").kid(
+                        CNode::param(ParamKind::Word, "policy", "Policy map name")
+                            .run(cmd::zbf_recognized_only),
+                    ),
+                ),
+            ),
+            CNode::lit("exit", "Exit from policy-map class mode").run(h_exit),
             CNode::lit("end", "Exit to privileged mode").run(h_end),
         ],
         ipsec: vec![

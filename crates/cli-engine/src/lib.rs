@@ -3,6 +3,8 @@
 //! 方言（IOS/VRP/Comware）在 cli-dialects 中把命令树"数据"建出来，
 //! 本 crate 负责解析、前缀缩写、`?` 帮助与 Tab 补全的通用机制。
 
+pub mod spec;
+
 use sim_core::device::{DevId, DeviceKind, Dialect, MgmtProto, PortId, VlanId};
 use sim_core::engine::Engine;
 
@@ -28,7 +30,13 @@ pub type CmdFn = fn(&mut Ctx) -> Result<String, CliError>;
 
 pub enum Tok {
     Lit(String),
-    Param { kind: ParamKind, name: String },
+    Param {
+        kind: ParamKind,
+        name: String,
+        /// 可选参数：命令可在该参数处结束；用于官方 `inspect [parameter-map]`
+        /// 与 `show ... zone-pair [name]` 这类中括号语法。
+        optional: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -46,6 +54,23 @@ pub enum ParamKind {
     WordList,
     /// 接口名（由方言层解析）
     IfName,
+}
+
+impl ParamKind {
+    /// 稳定 ID / 结构指纹中的参数槽标记，不含参数显示名。
+    pub fn tag(self) -> &'static str {
+        match self {
+            ParamKind::Ipv4 => "ipv4",
+            ParamKind::DottedMask => "dotted-mask",
+            ParamKind::Wildcard => "wildcard",
+            ParamKind::PrefixLen => "prefix-len",
+            ParamKind::Number => "number",
+            ParamKind::VlanList => "vlan-list",
+            ParamKind::Word => "word",
+            ParamKind::WordList => "word-list",
+            ParamKind::IfName => "if-name",
+        }
+    }
 }
 
 /// 命令树节点。
@@ -71,6 +96,21 @@ impl CNode {
             tok: Tok::Param {
                 kind,
                 name: name.to_string(),
+                optional: false,
+            },
+            help: help.to_string(),
+            run: None,
+            kids: vec![],
+        }
+    }
+
+    /// 可选参数（官方语法中的 `[parameter]`）：节点可在此结束并执行本节点的 run。
+    pub fn opt_param(kind: ParamKind, name: &str, help: &str) -> Self {
+        Self {
+            tok: Tok::Param {
+                kind,
+                name: name.to_string(),
+                optional: true,
             },
             help: help.to_string(),
             run: None,
@@ -91,6 +131,14 @@ impl CNode {
     pub fn kids(mut self, ks: Vec<CNode>) -> Self {
         self.kids.extend(ks);
         self
+    }
+}
+
+/// 稳定 ID 的单个路径段：字面量原样；参数只记槽序号与种类，不记显示名。
+pub(crate) fn node_segment(node: &CNode, param_slot: usize) -> String {
+    match &node.tok {
+        Tok::Lit(w) => w.clone(),
+        Tok::Param { kind, .. } => format!("@{param_slot}{}", kind.tag()),
     }
 }
 
@@ -122,6 +170,16 @@ pub struct SubCtx {
     pub rule: Option<String>,
     /// IPsec 隧道视图中的隧道名
     pub ipsec: Option<String>,
+    /// Stage 2B / H6：VRP OSPF 双层视图的 (进程号, 区域号)。
+    pub ospf: Option<(u32, u32)>,
+    /// 阶段 4A：Comware `vlan <id>` 进入 VLAN 视图后当前 VLAN ID。
+    pub vlan: Option<u16>,
+    /// 阶段 6B：ZBF class-map 视图中的类名。
+    pub cmap: Option<String>,
+    /// 阶段 6B：ZBF policy-map 视图中的策略名。
+    pub pmap: Option<String>,
+    /// 阶段 6B：ZBF policy-map class 视图中的类名（含 `class-default`）。
+    pub pmap_class: Option<String>,
 }
 
 /// 远程登录输入流程。
@@ -158,6 +216,8 @@ pub struct Session {
     pub login: Option<LoginFlow>,
     /// 已建立、尚未断开的远程会话
     pub remote: Option<RemoteSession>,
+    /// 本地 `enable` 已配置 enable secret，正在等待特权口令输入
+    pub enable_prompt: bool,
 }
 
 impl Session {
@@ -208,11 +268,60 @@ pub enum Mode {
     Ipsec,
     /// OSPFv3 进程视图
     Ospfv3,
+    /// Comware `vlan <id>` 进入的 VLAN 视图（官方 `[Sysname-vlan<n>]`）。
+    Vlan,
+    /// IOS XE ZBF `class-map type inspect` 视图（官方 `(config-cmap)#`）。
+    ClassMap,
+    /// IOS XE ZBF `policy-map type inspect` 视图（官方 `(config-pmap)#`）。
+    PolicyMap,
+    /// IOS XE ZBF `policy-map` 下的 `class` 视图（官方 `(config-pmap-c)#`）。
+    PolicyMapClass,
+    /// F5 tmsh `ltm` 模块（官方 `(tmos.ltm)#`）。
+    TmosLtm,
+    /// F5 tmsh `sys` 模块（官方 `(tmos.sys)#`）。
+    TmosSys,
+}
+
+impl Mode {
+    /// 稳定 ID 中的规范模式路径标签。
+    pub fn tag(self) -> &'static str {
+        match self {
+            Mode::Exec => "exec",
+            Mode::Priv => "priv",
+            Mode::Config => "config",
+            Mode::If => "if",
+            Mode::Pool => "pool",
+            Mode::Acl => "acl",
+            Mode::Line => "line",
+            Mode::Aaa => "aaa",
+            Mode::Mst => "mst",
+            Mode::Ospf => "ospf",
+            Mode::OspfArea => "ospf_area",
+            Mode::Bgp => "bgp",
+            Mode::Isis => "isis",
+            Mode::RoutePolicy => "route_policy",
+            Mode::Zone => "zone",
+            Mode::SecurityPolicy => "security_policy",
+            Mode::SecurityRule => "security_rule",
+            Mode::Ipsec => "ipsec",
+            Mode::Ospfv3 => "ospfv3",
+            Mode::Vlan => "vlan",
+            Mode::ClassMap => "class_map",
+            Mode::PolicyMap => "policy_map",
+            Mode::PolicyMapClass => "policy_map_class",
+            Mode::TmosLtm => "tmos_ltm",
+            Mode::TmosSys => "tmos_sys",
+        }
+    }
 }
 
 #[derive(Debug)]
 pub enum CliError {
     Unknown {
+        pos: usize,
+    },
+    /// 唯一前缀缩写命中多个字面量；独立于 `Unknown`，接方言 `% Ambiguous command` 类错误。
+    Ambiguous {
         pos: usize,
     },
     Incomplete {
@@ -234,6 +343,13 @@ pub struct Ctx<'a> {
     pub sess: &'a mut Session,
     pub dialect: Dialect,
     pub vals: Vec<(String, Val)>,
+    /// 模拟器限制/验证状态提示；不得写入设备输出通道。
+    pub notices: Vec<String>,
+    /// 阶段 5A：handler 判定「语法有效但承诺语义未模拟」时置位。
+    /// 由 cli-dialects 的 `exec_line_result` 转成 `CommandStatus::NotSimulated`；
+    /// 用于按**参数值**判定未模拟（例如非 `/Common/` 分区），规格表按稳定 ID
+    /// 无法表达这类运行时分支。置位时不得改动 `sim-core` 状态。
+    pub not_simulated: bool,
 }
 
 impl Ctx<'_> {
@@ -291,13 +407,22 @@ impl Ctx<'_> {
             .map(|d| d.kind)
             .unwrap_or(DeviceKind::Router)
     }
+
+    /// 平台默认策略：在方言边界由 dialect 显式派生，handler 只消费策略字段，
+    /// 不在共享语义里内嵌 `if dialect`。
+    pub fn platform_policy(&self) -> sim_core::profile::PlatformPolicy {
+        sim_core::profile::platform_policy(self.dialect)
+    }
 }
 
 // ---------- 解析 ----------
 
+#[derive(Debug)]
 pub struct Parsed {
     pub run: CmdFn,
     pub vals: Vec<(String, Val)>,
+    /// 解析命中的可执行节点路径段，用于派生稳定命令 ID（不含模式标签）。
+    pub path: Vec<String>,
 }
 
 /// 词法：返回 (token, 起始字符序号)。
@@ -391,50 +516,67 @@ pub fn parse_vlan_list(s: &str) -> Option<Vec<u16>> {
 
 enum MatchFail {
     Unknown,
+    /// 缩写命中多个字面量；不得随机选择，必须独立报错。
+    Ambiguous,
 }
 
-/// 在当前层子节点中匹配一个 token。返回 (节点, 是否作为参数消费)。
-fn match_token<'a>(kids: &'a [CNode], word: &str) -> Result<(&'a CNode, Option<Val>), MatchFail> {
-    let mut exact: Option<&CNode> = None;
-    let mut abbr: Vec<&CNode> = vec![];
-    let mut param: Option<(&CNode, Val)> = None;
+/// 在当前层子节点中匹配一个 token。
+/// 返回 (节点, 是否作为参数消费, 该节点在其兄弟参数中的槽序号)；槽序号用于稳定 ID。
+fn match_token<'a>(
+    kids: &'a [CNode],
+    word: &str,
+) -> Result<(&'a CNode, Option<Val>, usize), MatchFail> {
+    let mut exact: Option<(&CNode, usize)> = None;
+    let mut abbr: Vec<(&CNode, usize)> = vec![];
+    let mut param: Option<(&CNode, Val, usize)> = None;
+    let mut pslot = 0usize;
     for n in kids {
         match &n.tok {
             Tok::Lit(w) => {
                 if w.eq_ignore_ascii_case(word) {
-                    exact = Some(n);
+                    exact = Some((n, 0));
                 } else if word.len() < w.len() && w.to_lowercase().starts_with(&word.to_lowercase())
                 {
-                    abbr.push(n);
+                    abbr.push((n, 0));
                 }
             }
             Tok::Param { kind, .. } => {
+                let slot = pslot;
+                pslot += 1;
                 if param.is_none() {
                     if let Some(v) = parse_param(*kind, word) {
-                        param = Some((n, v));
+                        param = Some((n, v, slot));
                     }
                 }
             }
         }
     }
-    if let Some(e) = exact {
-        return Ok((e, None));
+    if let Some((e, slot)) = exact {
+        return Ok((e, None, slot));
     }
     if abbr.len() == 1 {
-        return Ok((abbr[0], None));
+        return Ok((abbr[0].0, None, abbr[0].1));
     }
     if abbr.len() > 1 {
-        return Err(MatchFail::Unknown); // 缩写歧义
+        return Err(MatchFail::Ambiguous); // 缩写歧义：独立结果，不折叠为 Unknown
     }
-    if let Some((n, v)) = param {
-        return Ok((n, Some(v)));
+    if let Some((n, v, slot)) = param {
+        return Ok((n, Some(v), slot));
     }
     Err(MatchFail::Unknown)
 }
 
 /// 节点是否带有必填参数子节点。
 fn has_param_kids(node: &CNode) -> bool {
-    node.kids.iter().any(|k| matches!(k.tok, Tok::Param { .. }))
+    node.kids.iter().any(|k| {
+        matches!(
+            k.tok,
+            Tok::Param {
+                optional: false,
+                ..
+            }
+        )
+    })
 }
 
 /// 解析一行命令。空行返回 Ok(None)。
@@ -452,12 +594,15 @@ pub fn parse(root: &[CNode], line: &str) -> Result<Option<Parsed>, CliError> {
     let mut kids = root;
     let mut vals: Vec<(String, Val)> = vec![];
     let mut last_run: Option<CmdFn> = None;
+    let mut last_run_path: Option<Vec<String>> = None;
+    let mut path: Vec<String> = vec![];
     let mut path_had_run = false;
     let n_toks = toks.len();
     for (i, (word, start)) in toks.iter().enumerate() {
         let last = i + 1 == n_toks;
         match match_token(kids, word) {
-            Ok((node, v)) => {
+            Ok((node, v, slot)) => {
+                path.push(node_segment(node, slot));
                 if let (Some(v), Tok::Param { name, .. }) = (v, &node.tok) {
                     // VlanList / WordList 参数天然贪婪：吞掉行内剩余 token
                     let greedy = matches!(v, Val::VlanList(_) | Val::WordList(_)) && i + 1 < n_toks;
@@ -480,8 +625,17 @@ pub fn parse(root: &[CNode], line: &str) -> Result<Option<Parsed>, CliError> {
                                 vals.push((name2, v2));
                                 // 直接按"最后一段参数"收尾
                                 let run = node.run.or(last_run);
+                                let id_path = if node.run.is_some() {
+                                    path.clone()
+                                } else {
+                                    last_run_path.clone().unwrap_or_default()
+                                };
                                 return match run {
-                                    Some(run) => Ok(Some(Parsed { run, vals })),
+                                    Some(run) => Ok(Some(Parsed {
+                                        run,
+                                        vals,
+                                        path: id_path,
+                                    })),
                                     None => Err(CliError::Incomplete { pos: end_char }),
                                 };
                             }
@@ -498,20 +652,29 @@ pub fn parse(root: &[CNode], line: &str) -> Result<Option<Parsed>, CliError> {
                         return Err(CliError::Incomplete { pos: end_pos });
                     }
                     if let Some(run) = node.run {
-                        return Ok(Some(Parsed { run, vals }));
+                        return Ok(Some(Parsed { run, vals, path }));
                     }
                     if matches!(node.tok, Tok::Param { .. }) {
                         if let Some(run) = last_run {
-                            return Ok(Some(Parsed { run, vals }));
+                            return Ok(Some(Parsed {
+                                run,
+                                vals,
+                                path: last_run_path.unwrap_or_default(),
+                            }));
                         }
                     }
                     return Err(CliError::Incomplete { pos: end_pos });
                 }
                 if node.run.is_some() {
                     last_run = node.run;
+                    last_run_path = Some(path.clone());
                     path_had_run = true;
                 }
                 kids = &node.kids;
+            }
+            Err(MatchFail::Ambiguous) => {
+                // 歧义缩写独立报错；不因前面出现过完整命令而降级为 TooMany/Unknown。
+                return Err(CliError::Ambiguous { pos: *start });
             }
             Err(MatchFail::Unknown) => {
                 // 命令路径上出现过完整命令 → 多余参数；否则无法识别
@@ -570,10 +733,10 @@ pub fn help_for(root: &[CNode], line: &str, dialect: Dialect) -> Option<HelpList
     let mut kids = root;
     for (word, _) in &toks {
         match match_token(kids, word) {
-            Ok((node, _)) => {
+            Ok((node, _, _)) => {
                 kids = &node.kids;
             }
-            Err(MatchFail::Unknown) => {
+            Err(_) => {
                 return Some(HelpList {
                     items: vec![],
                     cr: false,
@@ -627,8 +790,8 @@ pub fn complete(root: &[CNode], line: &str) -> (String, Vec<String>) {
     let mut kids = root;
     for (word, _) in toks.iter().take(walk_n) {
         match match_token(kids, word) {
-            Ok((node, _)) => kids = &node.kids,
-            Err(MatchFail::Unknown) => return (line.to_string(), vec![]),
+            Ok((node, _, _)) => kids = &node.kids,
+            Err(_) => return (line.to_string(), vec![]),
         }
     }
     let mut cands: Vec<&str> = vec![];
@@ -703,6 +866,86 @@ pub mod placeholder {
             (ParamKind::WordList, _) => "<word-list>",
             (ParamKind::IfName, Dialect::Ios) => "INTERFACE",
             (ParamKind::IfName, _) => "<interface>",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn noop(_: &mut Ctx) -> Result<String, CliError> {
+        Ok(String::new())
+    }
+
+    /// `show` 与 `shutdown` 共享前缀 `sh`；`configure` 唯一前缀 `conf`。
+    fn tree() -> Vec<CNode> {
+        vec![
+            CNode::lit("show", "Show").run(noop),
+            CNode::lit("shutdown", "Shutdown").run(noop),
+            CNode::lit("configure", "Configure").run(noop),
+        ]
+    }
+
+    #[test]
+    fn unique_abbreviation_matches_full_command_path() {
+        let root = tree();
+        // 所有合法唯一前缀缩写与全称派生同一稳定路径（执行同一 handler）。
+        for abbr in ["sho", "show"] {
+            let full = parse(&root, "show").unwrap().unwrap();
+            let shortened = parse(&root, abbr).unwrap().unwrap();
+            assert_eq!(full.path, shortened.path, "abbr={abbr}");
+        }
+        for abbr in ["conf", "config", "configure"] {
+            let full = parse(&root, "configure").unwrap().unwrap();
+            let shortened = parse(&root, abbr).unwrap().unwrap();
+            assert_eq!(full.path, shortened.path, "abbr={abbr}");
+        }
+    }
+
+    #[test]
+    fn ambiguous_abbreviation_is_distinct_from_unknown() {
+        let root = tree();
+        // `sh` 同时命中 show/shutdown：必须是 Ambiguous，而非 Unknown。
+        for abbr in ["sh", "s"] {
+            match parse(&root, abbr) {
+                Err(CliError::Ambiguous { pos }) => assert_eq!(pos, 0, "abbr={abbr}"),
+                other => panic!("abbr={abbr} 应为 Ambiguous，实际 {other:?}"),
+            }
+        }
+        // 完全不存在的命令仍是 Unknown。
+        match parse(&root, "zzz") {
+            Err(CliError::Unknown { .. }) => {}
+            other => panic!("zzz 应为 Unknown，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ambiguous_abbreviation_never_randomly_selects_a_command() {
+        let root = tree();
+        // 重复解析同一歧义输入，结果必须稳定为 Ambiguous，不得偶尔命中某条命令。
+        for _ in 0..32 {
+            assert!(matches!(
+                parse(&root, "sh"),
+                Err(CliError::Ambiguous { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn ambiguous_after_complete_command_stays_ambiguous_not_too_many() {
+        // 即便路径上已出现可执行命令，歧义缩写仍报 Ambiguous，不降级为 TooMany。
+        let root = vec![CNode::lit("show", "Show")
+            .run(noop)
+            .kid(CNode::lit("ip", "IP").run(noop))
+            .kid(CNode::lit("ipv6", "IPv6").run(noop))];
+        match parse(&root, "show ip") {
+            Ok(Some(_)) => {}
+            other => panic!("show ip 应可执行，实际 {other:?}"),
+        }
+        match parse(&root, "show i") {
+            Err(CliError::Ambiguous { pos }) => assert_eq!(pos, 5),
+            other => panic!("show i 应为 Ambiguous，实际 {other:?}"),
         }
     }
 }

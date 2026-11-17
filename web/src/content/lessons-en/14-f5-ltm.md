@@ -15,12 +15,20 @@ When one web server cannot keep up, the obvious fix is more servers — but user
 - **Member**: one server in the pool, which can be marked healthy or taken out individually;
 - **Algorithm**: round robin is the simplest; least connections or hashing are alternatives.
 
+Starting with Stage 5A, LTM uses the independent F5 BIG-IP **TMOS 17.x / tmsh** dialect (`Dialect::Tmos`), not the teaching abstraction that used to hang off IOS/VRP/Comware. Official `ltm pool` / `ltm virtual` syntax and module navigation are documented in F5 TMSH Reference v17.
+
 ```
-LB1:
-ltm pool WEB member 10.0.1.10 80
-ltm pool WEB member 10.0.2.11 80
-ltm virtual VS vip 10.0.0.100 80 pool WEB
+(tmos)# ltm
+(tmos.ltm)# create pool WEB
+(tmos.ltm)# modify pool WEB members add { 10.0.1.10:80 }
+(tmos.ltm)# modify pool WEB members add { 10.0.2.11:80 }
+(tmos.ltm)# create virtual VS destination 10.0.0.100:80 pool WEB
+(tmos.ltm)# list pool
+(tmos.ltm)# exit
+(tmos)#
 ```
+
+Objects live in the default `/Common` partition; `exit` leaves the current module and `quit` leaves tmsh entirely.
 
 ## How the addresses are rewritten
 
@@ -29,8 +37,8 @@ Clients know only the VIP. When a connection arrives, the LTM does two things:
 - **DNAT**: rewrite the destination from the VIP to the selected member's IP;
 - **SNAT / return path**: record the session so the member's replies return to the right client and leave from the VIP.
 
-As a result, servers may see a source address other than the client's real one, while the client always believes it is talking to the VIP. The session table in `display ltm` / `show ltm` shows the "client → VIP → member" mapping directly.
+As a result, servers may see a source address other than the client's real one, while the client always believes it is talking to the VIP. The Sessions section of `show ltm pool` shows the "client → VIP → member" mapping directly.
 
 ## Hands-on
 
-Open Lab 19: LB1 has three interfaces for the client and two servers. After configuring the pool and VS, run `tcp 10.0.0.100 80` twice from PC1 — both should connect. The Sessions list in `display ltm` should contain two entries pointing at different members, proving round robin. Shut down one server and connect again to see whether traffic lands only on the surviving member.
+Open Lab 19: LB1 has three interfaces for the client and two servers. After configuring the pool and VS with the tmsh sequence from the lab tasks, run `tcp 10.0.0.100 80` three times from PC1 — all should connect. The Sessions list in `show ltm pool` should contain three entries landing on at least two different members, proving round robin. Shut down one server and connect again to see whether traffic lands only on the surviving member.

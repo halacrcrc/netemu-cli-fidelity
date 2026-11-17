@@ -59,6 +59,8 @@ pub enum Dialect {
     Vrp,
     /// 新华三 Comware 风格
     Comware,
+    /// F5 BIG-IP TMOS 17.x / tmsh（阶段 5A 独立方言）
+    Tmos,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -291,6 +293,8 @@ pub struct DhcpLease {
 pub enum AclProto {
     Any,
     Icmp,
+    /// Stage 2B / C5：TCP 规则，需匹配源/目的端口。
+    Tcp,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -301,17 +305,55 @@ pub struct AclRule {
     pub src_wildcard: u32,
     pub dst: Ipv4Addr,
     pub dst_wildcard: u32,
+    /// Stage 2B / C5：TCP 规则端口约束；`None` = 不限制该方向端口。
+    /// 旧存档无此字段，缺省为不限制。
+    #[serde(default)]
+    pub src_port: Option<u16>,
+    #[serde(default)]
+    pub dst_port: Option<u16>,
     /// 命中计数（教学展示用）
     pub hits: u64,
 }
 
+/// 数据面探测上下文：协议 + TCP 源/目的端口。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AclProbe {
+    pub proto: AclProto,
+    pub src_port: u16,
+    pub dst_port: u16,
+}
+
+impl AclProbe {
+    pub fn icmp() -> Self {
+        Self {
+            proto: AclProto::Icmp,
+            src_port: 0,
+            dst_port: 0,
+        }
+    }
+    pub fn tcp(src_port: u16, dst_port: u16) -> Self {
+        Self {
+            proto: AclProto::Tcp,
+            src_port,
+            dst_port,
+        }
+    }
+}
+
 impl AclRule {
-    /// 数据报文是否命中本条规则（M2b 仅 ICMP/任意协议区分）。
-    /// 通配符位为 1 表示忽略；源/目的都为 0 且通配符为 0 视为未限制该字段。
-    pub fn matches(&self, src: Ipv4Addr, dst: Ipv4Addr, is_icmp: bool) -> bool {
+    /// 数据报文是否命中本条规则。通配符位为 1 表示忽略；
+    /// 源/目的都为 0 且通配符为 0 视为未限制该字段。
+    pub fn matches(&self, src: Ipv4Addr, dst: Ipv4Addr, probe: AclProbe) -> bool {
         let proto_ok = match self.proto {
             AclProto::Any => true,
-            AclProto::Icmp => is_icmp,
+            AclProto::Icmp | AclProto::Tcp => self.proto == probe.proto,
+        };
+        let port_ok = match self.proto {
+            AclProto::Tcp => {
+                self.src_port.is_none_or(|p| p == probe.src_port)
+                    && self.dst_port.is_none_or(|p| p == probe.dst_port)
+            }
+            _ => true,
         };
         let src_ok = (src & !self.src_wildcard) == (self.src & !self.src_wildcard);
         let dst_ok = if self.dst == 0 && self.dst_wildcard == 0 {
@@ -319,7 +361,7 @@ impl AclRule {
         } else {
             (dst & !self.dst_wildcard) == (self.dst & !self.dst_wildcard)
         };
-        proto_ok && src_ok && dst_ok
+        proto_ok && port_ok && src_ok && dst_ok
     }
 
     /// 路由前缀匹配：只看源地址段（协议/目的不参与路由过滤）。
@@ -336,14 +378,24 @@ pub struct Acl {
 
 impl Acl {
     /// 首条命中规则决定结果；无命中 = 隐式拒绝（真实语义）。
-    pub fn decide(&mut self, src: Ipv4Addr, dst: Ipv4Addr, is_icmp: bool) -> Option<bool> {
+    pub fn decide(&mut self, src: Ipv4Addr, dst: Ipv4Addr, probe: AclProbe) -> Option<bool> {
         for r in &mut self.rules {
-            if r.matches(src, dst, is_icmp) {
+            if r.matches(src, dst, probe) {
                 r.hits += 1;
                 return Some(r.permit);
             }
         }
         None
+    }
+
+    /// 只读判定：作为 ZBF class-map 的 `match access-group` 条件使用，
+    /// 不累加 ACL 计数（避免策略判定路径产生额外可见副作用）。
+    pub fn matches_readonly(&self, src: Ipv4Addr, dst: Ipv4Addr, probe: AclProbe) -> bool {
+        self.rules
+            .iter()
+            .find(|r| r.matches(src, dst, probe))
+            .map(|r| r.permit)
+            .unwrap_or(false)
     }
 }
 
@@ -385,9 +437,26 @@ pub struct RouterState {
     pub pending: Vec<PendingFrame>,
     pub pings: Vec<PingSession>,
     pub next_ping_id: u32,
-    /// OSPF network 语句（网段 + 通配符），区域固定为 0（简化）
+    /// OSPF network 语句（网段 + 通配符）。
     #[serde(default)]
     pub ospf_networks: Vec<(Ipv4Addr, Ipv4Addr)>,
+    /// Stage 2B / C7·H6：OSPF 真实进程号与区域，配置视图与 Hello 都从这里取，
+    /// 不再硬编码进程 1 / area 0。`None` 表示未创建进程。
+    #[serde(default)]
+    pub ospf_process: Option<u32>,
+    /// 当前进程下 network 语句所属区域（单区域进程模型；区域不匹配不建邻）。
+    #[serde(default)]
+    pub ospf_area: u32,
+    /// Stage 2B / C3：DHCP 排除地址段（闭区间），命中则不可分配。
+    #[serde(default)]
+    pub dhcp_excluded: Vec<(Ipv4Addr, Ipv4Addr)>,
+    /// Stage 2B / C3：VRP `dhcp select global` 显式启用的服务器接口。
+    /// 为空时沿用「按接收接口网段匹配池」的原有行为，避免改变既有数据面。
+    #[serde(default)]
+    pub dhcp_server_ports: Vec<PortId>,
+    /// Stage 2B / C4：EasyIP 绑定的 ACL 编号与出口接口；`no` 形式清空。
+    #[serde(default)]
+    pub nat_easyip: Option<(u32, PortId)>,
     /// OSPF 计算出的动态路由（瞬态）
     #[serde(default)]
     pub ospf_routes: Vec<Route>,
@@ -423,15 +492,27 @@ pub struct RouterState {
     /// 路由策略（BGP 邻居 import/export 使用）
     #[serde(default)]
     pub route_policies: Vec<RoutePolicy>,
-    /// 区域间安全策略（按顺序首条匹配，无命中 = 默认拒绝）
+    /// 安全区域（阶段 6A 基线：VRP `firewall zone <name>` 创建的区域）
+    #[serde(default)]
+    pub security_zones: Vec<SecurityZone>,
+    /// 安全策略规则（按顺序首条**启用**命中生效，无命中 = 缺省策略拒绝）
     #[serde(default)]
     pub security_policies: Vec<SecurityPolicy>,
-    /// 状态化会话（正向放行后允许反向回包）
+    /// 状态化会话（正向放行后允许反向回包；ICMP 会话表项）
     #[serde(default)]
     pub security_sessions: Vec<SecuritySession>,
     /// 防火墙 TCP 状态表
     #[serde(default)]
     pub tcp_flows: Vec<TcpFlow>,
+    /// 阶段 6B：IOS ZBF class-map 对象
+    #[serde(default)]
+    pub zbf_class_maps: Vec<ZbfClassMap>,
+    /// 阶段 6B：IOS ZBF policy-map 对象
+    #[serde(default)]
+    pub zbf_policy_maps: Vec<ZbfPolicyMap>,
+    /// 阶段 6B：IOS ZBF zone-pair 对象
+    #[serde(default)]
+    pub zbf_zone_pairs: Vec<ZbfZonePair>,
     /// IPsec 站点隧道（教学用 IP-in-IP）
     #[serde(default)]
     pub ipsec_tunnels: Vec<IpsecTunnel>,
@@ -453,16 +534,60 @@ pub struct IpsecTunnel {
     pub remote_subnet: (Ipv4Addr, u8),
 }
 
-/// 防火墙区域间策略。
+/// 安全区域（阶段 6A 基线：华为 VRP `firewall zone <name>`）。
+///
+/// 只有「已被 `firewall zone` 创建/进入过」的区域才进入本表；接口成员关系仍在
+/// `Port::zone`（唯一状态源，不建第二份成员表）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecurityZone {
+    pub name: String,
+    /// `set priority` 显式配置值；None = 使用预定义区域的文档缺省优先级。
+    #[serde(default)]
+    pub priority: Option<u8>,
+}
+
+impl SecurityZone {
+    /// 预定义区域缺省优先级（华为 VRP：local 100 / trust 85 / dmz 50 / untrust 5）。
+    /// 自定义区域无文档缺省值，返回 None 由调用方显示为空。
+    pub fn default_priority(name: &str) -> Option<u8> {
+        match name {
+            "local" => Some(100),
+            "trust" => Some(85),
+            "dmz" => Some(50),
+            "untrust" => Some(5),
+            _ => None,
+        }
+    }
+
+    pub fn effective_priority(&self) -> Option<u8> {
+        self.priority.or_else(|| Self::default_priority(&self.name))
+    }
+}
+
+/// 安全策略规则（阶段 6A 基线：华为 VRP `security-policy` → `rule name <n>`）。
+///
+/// 按 `Vec` 顺序自上而下首条命中生效；`enabled` 对应规则视图 `enable` / `disable`
+/// （文档缺省为启用）。`hits` 只作 `display security-policy` 的 HITTED 计数展示。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SecurityPolicy {
     pub name: String,
     pub src_zone: String,
     pub dst_zone: String,
     pub permit: bool,
+    /// 规则是否启用；旧存档无该字段时缺省为 true（文档缺省启用）。
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub hits: u64,
 }
 
-/// 状态化放行记录（仅 ICMP，本模拟器的三层载荷）。
+fn default_true() -> bool {
+    true
+}
+
+/// 状态化放行记录（ICMP 会话表项）。
+///
+/// 匹配键：源 IP + 目的 IP + ICMP echo id，**双向**匹配（回包按反向三元组命中）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SecuritySession {
     pub src: Ipv4Addr,
@@ -480,7 +605,11 @@ pub enum TcpFlowState {
     Closed,
 }
 
-/// 防火墙 TCP 五元组状态（示例只跟踪握手/挥手）。
+/// 防火墙 TCP 会话表项（阶段 6A：**双向五元组**）。
+///
+/// 匹配键 = 源 IP + 目的 IP + 源端口 + 目的端口 + 隐含 TCP 协议；正反向均可命中，
+/// 因此回包无需方向字段。首包（SYN，不带 ACK）建表，后续报文命中会话直接转发，
+/// **不再复查安全策略**（华为《什么是安全策略》过滤机制）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TcpFlow {
     pub client: Ipv4Addr,
@@ -489,6 +618,90 @@ pub struct TcpFlow {
     pub server_port: u16,
     pub state: TcpFlowState,
     pub last_ns: u64,
+}
+
+// ---------- 阶段 6B：Cisco IOS XE 17.x ZBF 平台对象 ----------
+//
+// ZBF 的真实结构是 zone-pair → policy-map → class-map，而不是
+// 「源区域/目的区域/单一 permit」的扁平规则。这里保存平台原生对象图，
+// 数据面入口仍与 VRP 共享 `firewall_allow` / `firewall_tcp_allow` 和
+// `security_sessions` / `tcp_flows`；平台策略对象只选择「策略来源模型」。
+
+/// class-map 的匹配组合方式（官方 `class-map type inspect [match-any | match-all]`）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ZbfMatchType {
+    #[default]
+    Any,
+    All,
+}
+
+/// class-map 的单条匹配条件。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ZbfMatch {
+    /// `match protocol <name>`
+    Protocol(String),
+    /// `match access-group <number>`
+    AccessGroup(u32),
+}
+
+/// `class-map type inspect ...` 对象。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ZbfClassMap {
+    pub name: String,
+    #[serde(default)]
+    pub match_type: ZbfMatchType,
+    #[serde(default)]
+    pub matches: Vec<ZbfMatch>,
+}
+
+/// policy-map class 内的动作（官方 inspect / pass / drop）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ZbfAction {
+    /// 状态化检查：首包建立会话，回包命中会话表。
+    Inspect {
+        #[serde(default)]
+        parameter_map: Option<String>,
+    },
+    /// 无状态放行：不建立会话，反向流量必须有镜像策略。
+    Pass,
+    /// 丢弃；`log` 只记录配置意图，模拟器不产生日志。
+    Drop {
+        #[serde(default)]
+        log: bool,
+    },
+}
+
+/// policy-map 中的一个 class 及其动作。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ZbfPolicyClass {
+    /// 引用 `ZbfClassMap` 名称；系统类 `class-default` 用 `is_default = true`。
+    pub class_name: String,
+    #[serde(default)]
+    pub is_default: bool,
+    /// None = 该类未配置动作（class-default 未配置时官方缺省为 drop）。
+    #[serde(default)]
+    pub action: Option<ZbfAction>,
+    #[serde(default)]
+    pub hits: u64,
+}
+
+/// `policy-map type inspect <name>` 对象。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ZbfPolicyMap {
+    pub name: String,
+    #[serde(default)]
+    pub classes: Vec<ZbfPolicyClass>,
+}
+
+/// `zone-pair security <name> source <src> destination <dst>` 对象。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ZbfZonePair {
+    pub name: String,
+    pub src_zone: String,
+    pub dst_zone: String,
+    /// `service-policy type inspect <policy-map>`；None = 已建区域对但未挂策略（按官方 drop）。
+    #[serde(default)]
+    pub service_policy: Option<String>,
 }
 
 /// BGP 配置（AS、邻居、宣告网段、邻居策略）。
@@ -1064,12 +1277,19 @@ pub struct Port {
     /// 所属 VRF id（None = 全局表）
     #[serde(default)]
     pub vrf: Option<u16>,
-    /// 安全区域名（防火墙；None = 未划分）
+    /// 安全区域名（阶段 6A 基线：VRP `firewall zone <name>` + `add interface`；
+    /// None = 未划分安全区域）。一个接口只能属于一个区域。
     #[serde(default)]
     pub zone: Option<String>,
-    /// ASA 风格接口名与安全级别（防火墙；IOS `nameif` / `security-level`）
+    /// **落选血统（Cisco ASA）** 的接口名 —— 仅存档兼容保留。
+    ///
+    /// 阶段 6A 基线选择华为 VRP 安全策略后，ASA `nameif` 命令已从命令树移除、
+    /// 数据面不再引用；该字段只为旧存档往返不丢字段，不参与任何判定或渲染。
     #[serde(default)]
     pub nameif: Option<String>,
+    /// **落选血统（Cisco ASA）** 的安全级别 —— 仅存档兼容保留（理由同上）。
+    /// ASA 的「高安全级别→低安全级别默认放行」回退语义已在阶段 6A 删除，
+    /// 不再作为数据面兜底路径。
     #[serde(default)]
     pub security_level: Option<u8>,
     /// 入方向 ACL（路由器）
@@ -1194,6 +1414,19 @@ pub enum MgmtProto {
     Ssh,
 }
 
+impl MgmtProto {
+    /// 管理协议的标准服务端口（Telnet 23 / SSH 22）。
+    ///
+    /// 登录数据面接地用它构造 TCP 判定上下文：防火墙/ACL 规则按端口匹配，
+    /// 因此 `protocol inbound ssh` 的设备收到 23 的 SYN 与真实设备一致被拒。
+    pub fn port(self) -> u16 {
+        match self {
+            MgmtProto::Telnet => 23,
+            MgmtProto::Ssh => 22,
+        }
+    }
+}
+
 /// VTY 允许的接入协议。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VtyTransport {
@@ -1225,6 +1458,19 @@ pub struct MgmtUser {
     pub ssh: bool,
 }
 
+/// VTY 登录认证模式（Stage 2B / C6a）。裸 `login` 走线路口令，
+/// `login local` 走本地用户库，二者不得共用一个无差别布尔值。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LineAuthMode {
+    /// 未启用登录认证
+    #[default]
+    None,
+    /// 线路口令认证（`password <word>`）
+    Line,
+    /// 本地用户数据库认证
+    Local,
+}
+
 /// 设备管理面（厂商中立）：本地用户、VTY 认证与接入协议。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MgmtState {
@@ -1233,6 +1479,12 @@ pub struct MgmtState {
     /// 本地认证：IOS `login local` / VRP `authentication-mode aaa` / Comware `scheme`
     pub auth_local: bool,
     pub transport: VtyTransport,
+    /// Stage 2B / C6a：线路口令（仅存哈希式脱敏标记，配置视图永不输出明文）。
+    #[serde(default)]
+    pub line_password: Option<String>,
+    /// Stage 2B / C6a：明确的线路认证模式。旧存档缺字段时由 `auth_local` 推导。
+    #[serde(default)]
+    pub line_auth: LineAuthMode,
 }
 
 impl Default for MgmtState {
@@ -1242,6 +1494,18 @@ impl Default for MgmtState {
             enable_secret: None,
             auth_local: false,
             transport: VtyTransport::All,
+            line_password: None,
+            line_auth: LineAuthMode::None,
+        }
+    }
+}
+
+impl MgmtState {
+    /// 旧存档兼容：`line_auth` 缺省时按 `auth_local` 推导，不凭空造出新语义。
+    pub fn effective_line_auth(&self) -> LineAuthMode {
+        match self.line_auth {
+            LineAuthMode::None if self.auth_local => LineAuthMode::Local,
+            other => other,
         }
     }
 }
@@ -1393,17 +1657,13 @@ impl Default for WlanConfig {
 
 impl Device {
     pub fn new(id: DevId, name: String, kind: DeviceKind, dialect: Dialect) -> Self {
+        // 平台默认值来自显式策略对象（IOS 路由器默认 down，VRP 默认 up），
+        // 不在共享状态操作里按方言分支。
+        let default_admin_up = crate::profile::platform_policy(dialect).default_admin_up(kind);
         let ports = (0..kind.port_count())
             .map(|idx| Port {
                 idx,
-                // 与真实设备一致：交换机端口与主机网卡默认开启，路由器接口需手工 no shutdown
-                admin_up: !matches!(
-                    kind,
-                    DeviceKind::Router
-                        | DeviceKind::Firewall
-                        | DeviceKind::WlanController
-                        | DeviceKind::LoadBalancer
-                ),
+                admin_up: default_admin_up,
                 mac: port_mac(id, idx),
                 speed_bps: PORT_SPEED_BPS,
                 ip: None,

@@ -723,6 +723,8 @@ fn router_acl_deny_selected_icmp() {
                 src_wildcard: 0,
                 dst: ip("192.168.3.100"),
                 dst_wildcard: 0,
+                src_port: None,
+                dst_port: None,
                 hits: 0,
             }],
         });
@@ -977,7 +979,7 @@ fn ssh_login_auth_and_transport() {
         u.secret = "Cisco@123".into();
         u.privilege = 15;
     }
-    let eng = Engine::new(net);
+    let mut eng = Engine::new(net);
     assert_eq!(
         eng.try_login(pc, ip("192.168.1.1"), MgmtProto::Ssh, "admin", "Cisco@123"),
         Ok((r1, 15))
@@ -1016,7 +1018,7 @@ fn login_requires_auth_and_service_type() {
         d.mgmt.auth_local = true;
         d.mgmt.transport = VtyTransport::All;
     }
-    let eng = Engine::new(net);
+    let mut eng = Engine::new(net);
     assert_eq!(
         eng.try_login(pc, ip("192.168.1.1"), MgmtProto::Ssh, "admin", "pw"),
         Err(LoginError::AuthFailed),
@@ -1035,7 +1037,7 @@ fn login_requires_auth_and_service_type() {
 #[test]
 fn login_denied_without_local_auth() {
     let (net, pc, _r1) = mgmt_lab();
-    let eng = Engine::new(net);
+    let mut eng = Engine::new(net);
     assert_eq!(
         eng.try_login(pc, ip("192.168.1.1"), MgmtProto::Ssh, "admin", "pw"),
         Err(LoginError::AuthFailed),

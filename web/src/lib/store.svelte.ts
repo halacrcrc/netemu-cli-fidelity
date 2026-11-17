@@ -1,6 +1,7 @@
 // 全局应用状态（Svelte 5 runes 模块）。
 
 import type { DevSummary, LinkSummary, EngineStats } from './sim';
+import type { LabCheckResult } from './labs';
 
 export interface NodePos {
   x: number;
@@ -28,7 +29,7 @@ export const app = $state({
   /** 当前激活的实验标题（null = 未在实验模式） */
   labTitle: null as string | null,
   /** 最近一次实验检查结果 */
-  labChecks: null as null | { label: string; passed: boolean; detail: string }[],
+  labChecks: null as null | LabCheckResult[],
   /** 实验完成记录：labId → 是否曾全过（持久化于 localStorage） */
   labPassed: {} as Record<string, boolean>,
   /** 顶层视图 */
@@ -133,7 +134,7 @@ export function setLabTitle(t: string | null) {
   app.labTitle = t;
 }
 
-export function setLabChecks(c: null | { label: string; passed: boolean; detail: string }[]) {
+export function setLabChecks(c: null | LabCheckResult[]) {
   app.labChecks = c;
 }
 

@@ -1,5 +1,6 @@
 // 三厂商命令对照表（单一数据源）。
-// 每行都会在运行时经 wasm 的 verify_command 校验——保证表格与模拟器行为一致。
+// 每行按显式选择的 router / switch Profile 走 sim.inspect_command 的平台级纯读检查；
+// 不再使用旧 boolean verify_command 推导「完整支持」。
 
 export type CmdMode =
   | 'Exec'
@@ -19,23 +20,111 @@ export type CmdMode =
   | 'Zone'
   | 'SecurityPolicy'
   | 'SecurityRule'
+  | 'ClassMap'
+  | 'PolicyMap'
+  | 'PolicyMapClass'
   | 'Ipsec'
   | 'Ospfv3';
+
+/** 平台角色：决定能力门禁（尤其 IOS 的 L2SwitchPort 在 router / switch 下不同）。 */
+export type ProfileRole = 'router' | 'switch';
+/** 阶段 5A：F5 TMOS 17.x 是独立第四方言，LTM 命令只出现在这一列。 */
+export type CmdVendor = 'ios' | 'vrp' | 'comware' | 'tmos';
+
+/** 与 sim-core::profile 中稳定 Profile ID 一一对应；缓存 key 必须包含它。 */
+export const PROFILE_IDS: Record<CmdVendor, Record<ProfileRole, string>> = {
+  ios: { router: 'ios-xe-17-router', switch: 'ios-xe-17-l3-switch' },
+  vrp: { router: 'vrp-generic-router', switch: 'vrp-generic-l3-switch' },
+  comware: { router: 'comware-generic-router', switch: 'comware-generic-l3-switch' },
+  // TMOS 只有 LoadBalancer 一种设备类型，不按 router/switch 拆分。
+  tmos: { router: 'f5-bigip-tmos-17-loadbalancer', switch: 'f5-bigip-tmos-17-loadbalancer' },
+};
+
+/**
+ * 课程映射：逐 topic 显式声明平台角色，避免把 L2 命令静默套到 router Profile。
+ * 未登记的 topic 会在 profileForRow 中报错，而不是默认成 router。
+ */
+export const TOPIC_PROFILE_ROLE: Record<string, ProfileRole> = {
+  basics: 'router',
+  vlan: 'switch',
+  stp: 'switch',
+  dhcp: 'router',
+  acl: 'router',
+  nat: 'router',
+  ospf: 'router',
+  bgp: 'router',
+  mpls: 'router',
+  security: 'router',
+  ipsec: 'router',
+  sslvpn: 'router',
+  wlan: 'router',
+  vxlan: 'switch',
+  ha: 'switch',
+  ltm: 'router',
+  campus: 'router',
+  lag: 'switch',
+  stack: 'switch',
+  mlag: 'switch',
+  fhrp: 'router',
+  ipv4: 'router',
+  routing: 'router',
+  ipv6: 'router',
+  services: 'router',
+  isis: 'router',
+  qos: 'router',
+  ops: 'router',
+  isolation: 'switch',
+  ospfv3: 'router',
+  srv6: 'router',
+  mgmt: 'router',
+};
 
 export interface CmdRow {
   /** 功能描述 */
   feature: string;
   topic: string;
-  /** 模拟器支持的三方言写法（示例参数按常用拓扑填写） */
+  /** 各平台真实写法；空字符串表示该平台无逐字对应命令，不调用 inspection。 */
   ios: string;
   vrp: string;
   comware: string;
-  /** 命令所在模式（三方言共用） */
+  /** 阶段 5A：F5 TMOS 17.x / tmsh 真实写法（其余行留空 = 不适用）。 */
+  tmos?: string;
+  /** 命令所在模式（各列共用；tmsh 的 root 模块是 Exec） */
   mode: CmdMode;
   /** 个别厂商模式不同时的覆盖 */
   modeIos?: CmdMode;
   modeVrp?: CmdMode;
   modeComware?: CmdMode;
+  modeTmos?: CmdMode;
+  /** 行级显式角色覆盖（例如 campus 中的 Trunk 行）。 */
+  role?: ProfileRole;
+  /** 行级显式 Profile ID 覆盖（最高优先级）。 */
+  profileIos?: string;
+  profileVrp?: string;
+  profileComware?: string;
+  profileTmos?: string;
+  /**
+   * Stage 3B：netemu 教学抽象标识（课程内容元数据，不是第五种执行状态）。
+   * 只标在确实不是厂商 CLI 的单元格上；结构化 status/support/evidence 照常展示。
+   */
+  teachingVendors?: CmdVendor[];
+}
+
+export function rowMode(row: CmdRow, vendor: CmdVendor): CmdMode {
+  if (vendor === 'ios') return row.modeIos ?? row.mode;
+  if (vendor === 'vrp') return row.modeVrp ?? row.mode;
+  if (vendor === 'comware') return row.modeComware ?? row.mode;
+  return row.modeTmos ?? row.mode;
+}
+
+/** 每行显式选择 Profile：行级 ID > 行级角色 > 已登记的 topic 角色。 */
+export function profileForRow(row: CmdRow, vendor: CmdVendor): string {
+  const explicit =
+    vendor === 'ios' ? row.profileIos : vendor === 'vrp' ? row.profileVrp : vendor === 'comware' ? row.profileComware : row.profileTmos;
+  if (explicit) return explicit;
+  const role = row.role ?? TOPIC_PROFILE_ROLE[row.topic];
+  if (!role) throw new Error(`课程对照表 topic ${row.topic} 未显式登记 Profile 角色`);
+  return PROFILE_IDS[vendor][role];
 }
 
 export const CMDMAP: CmdRow[] = [
@@ -71,7 +160,9 @@ export const CMDMAP: CmdRow[] = [
   // ACL
   { feature: '创建高级 ACL', topic: 'acl', ios: 'access-list 100 deny icmp 192.168.1.0 0.0.0.255 192.168.3.0 0.0.0.255', vrp: 'acl 3000', comware: 'acl advanced 3000', mode: 'Config' },
   { feature: 'ACL 加规则', topic: 'acl', ios: 'access-list 100 permit icmp 10.0.0.0 0.0.0.255 192.168.3.0 0.0.0.255', vrp: 'rule permit icmp source 10.0.0.0 0.0.0.255', comware: 'rule permit icmp source 10.0.0.0 0.0.0.255', mode: 'Acl', modeIos: 'Config' },
-  { feature: '接口应用 ACL', topic: 'acl', ios: 'ip access-group 100 in', vrp: 'traffic-filter inbound acl 3000', comware: 'traffic-filter inbound acl 3000', mode: 'If' },
+  // Stage 4A：Comware 官方写法是 packet-filter <acl> <dir>（E9）；VRP 才是 traffic-filter。
+  // 该 Comware 命令在模拟器里只识别、未模拟，不显示完整支持。
+  { feature: '接口应用 ACL', topic: 'acl', ios: 'ip access-group 100 in', vrp: 'traffic-filter inbound acl 3000', comware: 'packet-filter 3000 inbound', mode: 'If' },
   { feature: '查看 ACL', topic: 'acl', ios: 'show access-lists', vrp: 'display acl all', comware: 'display acl all', mode: 'Exec' },
 
   // NAT
@@ -137,24 +228,55 @@ export const CMDMAP: CmdRow[] = [
   { feature: '查看 LSP', topic: 'mpls', ios: 'show mpls lsp', vrp: 'display mpls lsp', comware: 'display mpls lsp', mode: 'Exec' },
   { feature: '查看 VRF 路由表', topic: 'mpls', ios: 'show ip route vrf CUST1', vrp: 'display ip routing-table vpn-instance CUST1', comware: 'display ip routing-table vpn-instance CUST1', mode: 'Exec' },
 
-  // 防火墙
-  { feature: '创建安全区域', topic: 'security', ios: 'zone security trust', vrp: 'firewall zone trust', comware: 'firewall zone trust', mode: 'Config' },
+  // 防火墙 / IOS XE 17.x ZBF 真实对照。
+  // 空字符串 = 该平台没有逐字对应命令，UI 显示「无逐字对应」且不调用 inspection。
+  // Stage 4A：Comware 用 security-zone name / import interface；VRP 才是 firewall zone / add interface。
+  // Stage 6A：防火墙基线 = 华为 VRP 安全策略。VRP 行已按规格升级为「完整支持」
+  // （Implemented + DocumentationOnly + strict，见 specs.rs 与 stage6a_firewall.rs）；
+  // Cisco ASA 的 nameif / security-level 已从命令树移除，不再出现在对照表；
+  // Comware 行保持 Stage 4A 边界（区域/策略可解析、可显示，安全数据面不在本包）。
+  // Stage 6B：IOS XE 17.x ZBF 已实现完整数据面（class-map → policy-map → zone-pair →
+  // service-policy；inspect 状态化 / pass 无状态 / drop），Stage 3B 的简化
+  // 旧简化 zone-pair 教学抽象（source/destination/action）已移除。
+  { feature: '创建安全区域', topic: 'security', ios: 'zone security trust', vrp: 'firewall zone trust', comware: 'security-zone name trust', mode: 'Config' },
   {
-    feature: '接口划入区域',
+    feature: '接口划入安全区域',
     topic: 'security',
     ios: 'zone-member security trust',
     vrp: 'add interface g0/0/0',
-    comware: 'add interface g0/0/0',
+    comware: 'import interface g1/0/1',
     mode: 'If',
     modeVrp: 'Zone',
     modeComware: 'Zone',
   },
-  { feature: '创建区域间策略', topic: 'security', ios: 'zone-pair security ZP', vrp: 'security-policy', comware: 'security-policy', mode: 'Config' },
-  { feature: '策略源区域', topic: 'security', ios: 'source trust', vrp: 'source-zone trust', comware: 'source-zone trust', mode: 'SecurityRule' },
-  { feature: '策略目的区域', topic: 'security', ios: 'destination untrust', vrp: 'destination-zone untrust', comware: 'destination-zone untrust', mode: 'SecurityRule' },
-  { feature: '策略动作', topic: 'security', ios: 'action permit', vrp: 'action permit', comware: 'action permit', mode: 'SecurityRule' },
+  { feature: 'IOS ZBF：定义检查类映射（class-map）', topic: 'security', ios: 'class-map type inspect match-any WEB', vrp: '', comware: '', mode: 'Config' },
+  { feature: 'IOS ZBF：类映射匹配协议（match protocol）', topic: 'security', ios: 'match protocol icmp', vrp: '', comware: '', mode: 'ClassMap' },
+  { feature: 'IOS ZBF：类映射匹配 ACL（match access-group）', topic: 'security', ios: 'match access-group 100', vrp: '', comware: '', mode: 'ClassMap' },
+  { feature: 'IOS ZBF：创建检查策略映射（policy-map）', topic: 'security', ios: 'policy-map type inspect PMAP', vrp: '', comware: '', mode: 'Config' },
+  { feature: 'IOS ZBF：策略映射引用类（class type inspect）', topic: 'security', ios: 'class type inspect WEB', vrp: '', comware: '', mode: 'PolicyMap' },
+  { feature: 'IOS ZBF：状态化检查（inspect）', topic: 'security', ios: 'inspect', vrp: '', comware: '', mode: 'PolicyMapClass' },
+  { feature: 'IOS ZBF：无状态放行（pass）', topic: 'security', ios: 'pass', vrp: '', comware: '', mode: 'PolicyMapClass' },
+  { feature: 'IOS ZBF：丢弃命中流量（drop）', topic: 'security', ios: 'drop', vrp: '', comware: '', mode: 'PolicyMapClass' },
+  { feature: 'IOS ZBF：创建区域对并指定方向（zone-pair）', topic: 'security', ios: 'zone-pair security IN-OUT source INSIDE destination OUTSIDE', vrp: '', comware: '', mode: 'Config' },
+  { feature: 'IOS ZBF：区域对挂接检查策略（service-policy）', topic: 'security', ios: 'service-policy type inspect PMAP', vrp: '', comware: '', mode: 'SecurityRule' },
+  { feature: 'IOS ZBF：查看区域对', topic: 'security', ios: 'show zone-pair security', vrp: '', comware: '', mode: 'Exec' },
+  { feature: 'IOS ZBF：删除类映射', topic: 'security', ios: 'no class-map WEB', vrp: '', comware: '', mode: 'Config' },
+  { feature: 'IOS ZBF：删除策略映射', topic: 'security', ios: 'no policy-map PMAP', vrp: '', comware: '', mode: 'Config' },
+  { feature: 'IOS ZBF：删除区域对', topic: 'security', ios: 'no zone-pair security IN-OUT', vrp: '', comware: '', mode: 'Config' },
+  { feature: 'IOS ZBF：解除区域对策略挂接', topic: 'security', ios: 'no service-policy type inspect PMAP', vrp: '', comware: '', mode: 'SecurityRule' },
+  { feature: '创建区域间策略（VRP / Comware）', topic: 'security', ios: '', vrp: 'security-policy', comware: 'security-policy', mode: 'Config' },
+  { feature: '策略源区域（VRP / Comware）', topic: 'security', ios: '', vrp: 'source-zone trust', comware: 'source-zone trust', mode: 'SecurityRule' },
+  { feature: '策略目的区域（VRP / Comware）', topic: 'security', ios: '', vrp: 'destination-zone untrust', comware: 'destination-zone untrust', mode: 'SecurityRule' },
+  { feature: '策略动作（VRP / Comware）', topic: 'security', ios: '', vrp: 'action permit', comware: 'action permit', mode: 'SecurityRule' },
   { feature: '查看安全区域', topic: 'security', ios: 'show zone security', vrp: 'display firewall zone', comware: 'display security-zone', mode: 'Exec' },
-  { feature: '查看安全策略', topic: 'security', ios: 'show zone-pair security', vrp: 'display security-policy', comware: 'display security-policy', mode: 'Exec' },
+  { feature: '查看检查策略 / 安全策略', topic: 'security', ios: 'show policy-map type inspect zone-pair', vrp: 'display security-policy', comware: 'display security-policy', mode: 'Exec' },
+  // Stage 6A 新增：会话表查询与清除（VRP 基线）；IOS/Comware 无逐字对应命令。
+  { feature: '查看会话表（VRP 基线）', topic: 'security', ios: '', vrp: 'display firewall session table', comware: '', mode: 'Exec' },
+  { feature: '清除会话表，使策略变更对既有流立即生效（VRP 基线）', topic: 'security', ios: '', vrp: 'reset firewall session table', comware: '', mode: 'Exec' },
+  { feature: '启用 / 禁用安全策略规则（VRP 基线）', topic: 'security', ios: '', vrp: 'disable', comware: '', mode: 'SecurityRule' },
+  { feature: '调整安全策略规则顺序（VRP 基线）', topic: 'security', ios: '', vrp: 'rule move allow-out before deny-all', comware: '', mode: 'SecurityPolicy' },
+  { feature: '删除安全策略规则（VRP 基线）', topic: 'security', ios: '', vrp: 'undo rule name allow-out', comware: '', mode: 'SecurityPolicy' },
+  { feature: '接口移出安全区域（VRP 基线）', topic: 'security', ios: '', vrp: 'undo add interface g0/0/0', comware: '', mode: 'Zone' },
 
   // IPsec / SSL VPN
   {
@@ -198,13 +320,15 @@ export const CMDMAP: CmdRow[] = [
   { feature: '查看堆叠', topic: 'ha', ios: 'show stack', vrp: 'display stack', comware: 'display stack', mode: 'Exec' },
   { feature: '查看 M-LAG', topic: 'ha', ios: 'show mlag', vrp: 'display mlag', comware: 'display mlag', mode: 'Exec' },
 
-  // F5 LTM
-  { feature: '添加池成员', topic: 'ltm', ios: 'ltm pool WEB member 10.0.1.10 80', vrp: 'ltm pool WEB member 10.0.1.10 80', comware: 'ltm pool WEB member 10.0.1.10 80', mode: 'Config' },
-  { feature: '创建虚拟服务器', topic: 'ltm', ios: 'ltm virtual VS vip 10.0.0.100 80 pool WEB', vrp: 'ltm virtual VS vip 10.0.0.100 80 pool WEB', comware: 'ltm virtual VS vip 10.0.0.100 80 pool WEB', mode: 'Config' },
-  { feature: '查看 LTM', topic: 'ltm', ios: 'show ltm', vrp: 'display ltm', comware: 'display ltm', mode: 'Exec' },
+  // 阶段 5A：LTM 只属于独立 F5 TMOS 17.x / tmsh。IOS / VRP / Comware 三列
+  // 全部为空（无逐字对应命令），不再用跨厂商抽象命令伪装成真实厂商 CLI。
+  { feature: '创建池并加入成员', topic: 'ltm', ios: '', vrp: '', comware: '', tmos: 'create ltm pool WEB members add { 10.0.1.10:80 }', mode: 'Exec' },
+  { feature: '创建虚拟服务器', topic: 'ltm', ios: '', vrp: '', comware: '', tmos: 'create ltm virtual VS destination 10.0.0.100:80 pool WEB', mode: 'Exec' },
+  { feature: '查看池配置', topic: 'ltm', ios: '', vrp: '', comware: '', tmos: 'list ltm pool /Common/WEB', mode: 'Exec' },
+  { feature: '查看虚拟服务器配置', topic: 'ltm', ios: '', vrp: '', comware: '', tmos: 'list ltm virtual /Common/VS', mode: 'Exec' },
 
   // 园区综合
-  { feature: 'Trunk 放行 VLAN', topic: 'campus', ios: 'switchport trunk allowed vlan 10,20', vrp: 'port trunk allow-pass vlan 10 20', comware: 'port trunk permit vlan 10 20', mode: 'If' },
+  { feature: 'Trunk 放行 VLAN', topic: 'campus', ios: 'switchport trunk allowed vlan 10,20', vrp: 'port trunk allow-pass vlan 10 20', comware: 'port trunk permit vlan 10 20', mode: 'If', role: 'switch' },
   { feature: '配置默认路由', topic: 'campus', ios: 'ip route 0.0.0.0 0.0.0.0 10.0.0.1', vrp: 'ip route-static 0.0.0.0 0 10.0.0.1', comware: 'ip route-static 0.0.0.0 0 10.0.0.1', mode: 'Config' },
   { feature: '查看 NAT 会话', topic: 'campus', ios: 'show ip nat translations', vrp: 'display nat session', comware: 'display nat session', mode: 'Exec' },
 
@@ -288,7 +412,7 @@ export const CMDMAP: CmdRow[] = [
   { feature: '进入 VTY 线路', topic: 'mgmt', ios: 'line vty 0 4', vrp: 'user-interface vty 0 4', comware: 'line vty 0 4', mode: 'Config' },
   { feature: '设置登录认证为本地', topic: 'mgmt', ios: 'login local', vrp: 'authentication-mode aaa', comware: 'authentication-mode aaa', mode: 'Line' },
   { feature: '限制登录协议为 SSH', topic: 'mgmt', ios: 'transport input ssh', vrp: 'protocol inbound ssh', comware: 'protocol inbound ssh', mode: 'Line' },
-  { feature: '创建本地用户', topic: 'mgmt', ios: 'username admin secret cisco123', vrp: 'local-user admin', comware: 'local-user admin', mode: 'Config' },
+  { feature: '创建本地用户', topic: 'mgmt', ios: 'username admin secret cisco123', vrp: 'local-user admin password cipher cisco123', comware: 'local-user admin password cipher cisco123', mode: 'Config' },
   { feature: 'SSH 登录对端', topic: 'mgmt', ios: 'ssh 10.0.0.2', vrp: 'ssh 10.0.0.2', comware: 'ssh 10.0.0.2', mode: 'Exec' },
   { feature: '查看当前配置', topic: 'basics', ios: 'show running-config', vrp: 'display current-configuration', comware: 'display current-configuration', mode: 'Exec' },
 ];

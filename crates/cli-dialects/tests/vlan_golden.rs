@@ -150,9 +150,11 @@ fn comware_vlan_flow() {
     let sw = net.add_device("SW1".into(), DeviceKind::Switch, Dialect::Comware);
     let mut eng = Engine::new(net);
     let mut sess = Session::default();
+    // E1/E11：`vlan 10` 进入 VLAN 视图，必须 quit 回系统视图才能进接口视图。
     let lines = [
         "system-view",
         "vlan 10",
+        "quit",
         "int g1/0/1",
         "port link-type trunk",
         "port trunk permit vlan 10 20",
@@ -174,7 +176,7 @@ fn comware_vlan_flow() {
 
     // display vlan 快照（permit 的 VLAN 自动登记进 VLAN 表）
     assert_eq!(
-        outs[6],
+        outs[7],
         "  VLAN ID Name                    Ports\n  \
          --------------------------------------------------------------------\n  \
          1       default                 GE1/0/1(U) GE1/0/2(U) GE1/0/3(U) GE1/0/4(U) GE1/0/5(U) GE1/0/6(U) GE1/0/7(U) GE1/0/8(U)\n  \

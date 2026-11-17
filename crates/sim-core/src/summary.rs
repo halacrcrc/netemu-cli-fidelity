@@ -71,6 +71,9 @@ pub struct DevSummary {
     pub name: String,
     pub kind: DeviceKind,
     pub dialect: Dialect,
+    /// 稳定 Profile ID；阶段 0 旧存档缺字段，由 `load()` 明确映射并提示用户。
+    #[serde(default)]
+    pub profile: Option<String>,
     pub ports: Vec<PortSummary>,
     /// 仅主机
     pub gw: Option<String>,
@@ -103,6 +106,25 @@ pub struct DevSummary {
     /// OSPF network 语句（网段, 通配符）
     #[serde(default)]
     pub ospf_networks: Vec<(String, String)>,
+    /// Stage 2B：真实 OSPF 进程号/区域与 DHCP/NAT 派生配置（旧存档缺省）。
+    #[serde(default)]
+    pub ospf_process: Option<u32>,
+    #[serde(default)]
+    pub ospf_area: u32,
+    #[serde(default)]
+    pub dhcp_excluded: Vec<(String, String)>,
+    #[serde(default)]
+    pub dhcp_server_ports: Vec<usize>,
+    #[serde(default)]
+    pub nat_easyip: Option<(u32, usize)>,
+    /// VRP `display stp brief` 用：STP 配置优先级与使能状态。
+    #[serde(default)]
+    pub stp_priority: Option<u16>,
+    #[serde(default)]
+    pub stp_enabled: bool,
+    /// VRP Eth-Trunk 成员的 LACP Selected 状态。
+    #[serde(default)]
+    pub lag_selected: Vec<(u16, Vec<usize>)>,
     /// VRRP 组配置
     #[serde(default)]
     pub vrrp: Vec<VrrpSummary>,
@@ -119,9 +141,21 @@ pub struct DevSummary {
     /// 路由策略
     #[serde(default)]
     pub route_policies: Vec<RoutePolicySummary>,
-    /// 防火墙区域间策略
+    /// 防火墙安全区域（阶段 6A）
+    #[serde(default)]
+    pub security_zones: Vec<SecurityZoneSummary>,
+    /// 防火墙安全策略规则
     #[serde(default)]
     pub security_policies: Vec<SecurityPolicySummary>,
+    /// 阶段 6B：IOS ZBF class-map
+    #[serde(default)]
+    pub zbf_class_maps: Vec<ZbfClassMapSummary>,
+    /// 阶段 6B：IOS ZBF policy-map
+    #[serde(default)]
+    pub zbf_policy_maps: Vec<ZbfPolicyMapSummary>,
+    /// 阶段 6B：IOS ZBF zone-pair
+    #[serde(default)]
+    pub zbf_zone_pairs: Vec<ZbfZonePairSummary>,
     /// IPsec 站点隧道
     #[serde(default)]
     pub ipsec_tunnels: Vec<IpsecTunnelSummary>,
@@ -215,6 +249,87 @@ pub struct SecurityPolicySummary {
     pub src_zone: String,
     pub dst_zone: String,
     pub permit: bool,
+    /// 阶段 6A：规则启用状态（旧存档缺省启用）。
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 阶段 6A：策略命中计数（展示用）。
+    #[serde(default)]
+    pub hits: u64,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// 阶段 6A：安全区域（`firewall zone` 创建的区域）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecurityZoneSummary {
+    pub name: String,
+    #[serde(default)]
+    pub priority: Option<u8>,
+}
+
+/// 阶段 6B：ZBF class-map 的一条匹配条件。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ZbfMatchSummary {
+    #[serde(default)]
+    pub protocol: Option<String>,
+    #[serde(default)]
+    pub access_group: Option<u32>,
+}
+
+/// 阶段 6B：ZBF class-map。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ZbfClassMapSummary {
+    pub name: String,
+    #[serde(default)]
+    pub match_any: bool,
+    #[serde(default)]
+    pub matches: Vec<ZbfMatchSummary>,
+}
+
+/// 阶段 6B：policy-map class 动作。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ZbfActionSummary {
+    Inspect {
+        #[serde(default)]
+        parameter_map: Option<String>,
+    },
+    Pass,
+    Drop {
+        #[serde(default)]
+        log: bool,
+    },
+}
+
+/// 阶段 6B：ZBF policy-map 的一个 class。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ZbfPolicyClassSummary {
+    pub class_name: String,
+    #[serde(default)]
+    pub is_default: bool,
+    #[serde(default)]
+    pub action: Option<ZbfActionSummary>,
+    #[serde(default)]
+    pub hits: u64,
+}
+
+/// 阶段 6B：ZBF policy-map。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ZbfPolicyMapSummary {
+    pub name: String,
+    #[serde(default)]
+    pub classes: Vec<ZbfPolicyClassSummary>,
+}
+
+/// 阶段 6B：ZBF zone-pair。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ZbfZonePairSummary {
+    pub name: String,
+    pub src_zone: String,
+    pub dst_zone: String,
+    #[serde(default)]
+    pub service_policy: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -343,6 +458,13 @@ pub struct AclRuleSummary {
     pub src_wildcard: String,
     pub dst: String,
     pub dst_wildcard: String,
+    /// Stage 2B / C5：TCP 端口约束与命中计数。旧存档无此字段。
+    #[serde(default)]
+    pub src_port: Option<String>,
+    #[serde(default)]
+    pub dst_port: Option<String>,
+    #[serde(default)]
+    pub hits: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -370,6 +492,9 @@ pub struct LinkSummary {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct NetSummary {
+    /// 0 = 阶段 0 旧存档（无版本字段、无 Profile），由 `load()` 迁移。
+    #[serde(default)]
+    pub schema_version: u32,
     pub devices: Vec<DevSummary>,
     #[serde(default)]
     pub links: Vec<LinkSummary>,
@@ -378,6 +503,7 @@ pub struct NetSummary {
 impl Net {
     pub fn summary(&self) -> NetSummary {
         NetSummary {
+            schema_version: crate::profile::SCHEMA_VERSION,
             devices: self
                 .devices
                 .iter()
@@ -386,6 +512,7 @@ impl Net {
                     name: d.name.clone(),
                     kind: d.kind,
                     dialect: d.dialect,
+                    profile: Some(crate::profile::profile_id_for(d.dialect, d.kind).to_string()),
                     ports: d
                         .ports
                         .iter()
@@ -470,11 +597,15 @@ impl Net {
                                         proto: match r.proto {
                                             AclProto::Any => "any".into(),
                                             AclProto::Icmp => "icmp".into(),
+                                            AclProto::Tcp => "tcp".into(),
                                         },
                                         src: ipv4_str(r.src),
                                         src_wildcard: ipv4_str(r.src_wildcard),
                                         dst: ipv4_str(r.dst),
                                         dst_wildcard: ipv4_str(r.dst_wildcard),
+                                        src_port: r.src_port.map(|p| p.to_string()),
+                                        dst_port: r.dst_port.map(|p| p.to_string()),
+                                        hits: r.hits,
                                     })
                                     .collect(),
                             })
@@ -525,6 +656,50 @@ impl Net {
                             .iter()
                             .map(|(n, w)| (ipv4_str(*n), ipv4_str(*w)))
                             .collect(),
+                        _ => vec![],
+                    },
+                    ospf_process: match &d.state {
+                        DeviceState::Router(rs) => rs.ospf_process,
+                        _ => None,
+                    },
+                    ospf_area: match &d.state {
+                        DeviceState::Router(rs) => rs.ospf_area,
+                        _ => 0,
+                    },
+                    dhcp_excluded: match &d.state {
+                        DeviceState::Router(rs) => rs
+                            .dhcp_excluded
+                            .iter()
+                            .map(|(a, b)| (ipv4_str(*a), ipv4_str(*b)))
+                            .collect(),
+                        _ => vec![],
+                    },
+                    dhcp_server_ports: match &d.state {
+                        DeviceState::Router(rs) => rs.dhcp_server_ports.clone(),
+                        _ => vec![],
+                    },
+                    nat_easyip: match &d.state {
+                        DeviceState::Router(rs) => rs.nat_easyip,
+                        _ => None,
+                    },
+                    stp_priority: match &d.state {
+                        DeviceState::Switch(sw) => Some(sw.stp.priority),
+                        _ => None,
+                    },
+                    stp_enabled: match &d.state {
+                        DeviceState::Switch(sw) => sw.stp.enabled,
+                        _ => false,
+                    },
+                    lag_selected: match &d.state {
+                        DeviceState::Switch(sw) => {
+                            let mut v: Vec<(u16, Vec<usize>)> = sw
+                                .lags
+                                .values()
+                                .map(|g| (g.id, g.selected.clone()))
+                                .collect();
+                            v.sort_by_key(|x| x.0);
+                            v
+                        }
                         _ => vec![],
                     },
                     vrrp: match &d.state {
@@ -604,6 +779,17 @@ impl Net {
                             .collect(),
                         _ => vec![],
                     },
+                    security_zones: match &d.state {
+                        DeviceState::Router(rs) => rs
+                            .security_zones
+                            .iter()
+                            .map(|z| SecurityZoneSummary {
+                                name: z.name.clone(),
+                                priority: z.priority,
+                            })
+                            .collect(),
+                        _ => vec![],
+                    },
                     security_policies: match &d.state {
                         DeviceState::Router(rs) => rs
                             .security_policies
@@ -613,6 +799,80 @@ impl Net {
                                 src_zone: p.src_zone.clone(),
                                 dst_zone: p.dst_zone.clone(),
                                 permit: p.permit,
+                                enabled: p.enabled,
+                                hits: p.hits,
+                            })
+                            .collect(),
+                        _ => vec![],
+                    },
+                    zbf_class_maps: match &d.state {
+                        DeviceState::Router(rs) => rs
+                            .zbf_class_maps
+                            .iter()
+                            .map(|c| ZbfClassMapSummary {
+                                name: c.name.clone(),
+                                match_any: c.match_type == crate::device::ZbfMatchType::Any,
+                                matches: c
+                                    .matches
+                                    .iter()
+                                    .map(|m| match m {
+                                        crate::device::ZbfMatch::Protocol(p) => ZbfMatchSummary {
+                                            protocol: Some(p.clone()),
+                                            access_group: None,
+                                        },
+                                        crate::device::ZbfMatch::AccessGroup(n) => {
+                                            ZbfMatchSummary {
+                                                protocol: None,
+                                                access_group: Some(*n),
+                                            }
+                                        }
+                                    })
+                                    .collect(),
+                            })
+                            .collect(),
+                        _ => vec![],
+                    },
+                    zbf_policy_maps: match &d.state {
+                        DeviceState::Router(rs) => rs
+                            .zbf_policy_maps
+                            .iter()
+                            .map(|p| ZbfPolicyMapSummary {
+                                name: p.name.clone(),
+                                classes: p
+                                    .classes
+                                    .iter()
+                                    .map(|c| ZbfPolicyClassSummary {
+                                        class_name: c.class_name.clone(),
+                                        is_default: c.is_default,
+                                        action: c.action.as_ref().map(|a| match a {
+                                            crate::device::ZbfAction::Inspect { parameter_map } => {
+                                                ZbfActionSummary::Inspect {
+                                                    parameter_map: parameter_map.clone(),
+                                                }
+                                            }
+                                            crate::device::ZbfAction::Pass => {
+                                                ZbfActionSummary::Pass
+                                            }
+                                            crate::device::ZbfAction::Drop { log } => {
+                                                ZbfActionSummary::Drop { log: *log }
+                                            }
+                                        }),
+                                        hits: c.hits,
+                                    })
+                                    .collect(),
+                            })
+                            .collect(),
+                        _ => vec![],
+                    },
+                    zbf_zone_pairs: match &d.state {
+                        DeviceState::Router(rs) => rs
+                            .zbf_zone_pairs
+                            .iter()
+                            .map(|z| ZbfZonePairSummary {
+                                name: z.name.clone(),
+                                src_zone: z.src_zone.clone(),
+                                dst_zone: z.dst_zone.clone(),
+                                service_policy: z.service_policy.clone(),
                             })
                             .collect(),
                         _ => vec![],
@@ -987,6 +1247,17 @@ impl Net {
                             rs.ospf_networks.push((net, wc));
                         }
                     }
+                    rs.ospf_process = ds
+                        .ospf_process
+                        .or_else(|| (!rs.ospf_networks.is_empty()).then_some(1));
+                    rs.ospf_area = ds.ospf_area;
+                    rs.dhcp_excluded = ds
+                        .dhcp_excluded
+                        .iter()
+                        .filter_map(|(a, b)| Some((ipv4_from_str(a)?, ipv4_from_str(b)?)))
+                        .collect();
+                    rs.dhcp_server_ports = ds.dhcp_server_ports.clone();
+                    rs.nat_easyip = ds.nat_easyip;
                     for g in &ds.vrrp {
                         if let Some(vip) = ipv4_from_str(&g.vip) {
                             rs.vrrp.push(VrrpGroup {
@@ -1043,12 +1314,74 @@ impl Net {
                                 .collect(),
                         });
                     }
+                    for z in &ds.security_zones {
+                        rs.security_zones.push(SecurityZone {
+                            name: z.name.clone(),
+                            priority: z.priority,
+                        });
+                    }
                     for p in &ds.security_policies {
                         rs.security_policies.push(SecurityPolicy {
                             name: p.name.clone(),
                             src_zone: p.src_zone.clone(),
                             dst_zone: p.dst_zone.clone(),
                             permit: p.permit,
+                            enabled: p.enabled,
+                            hits: p.hits,
+                        });
+                    }
+                    for c in &ds.zbf_class_maps {
+                        rs.zbf_class_maps.push(crate::device::ZbfClassMap {
+                            name: c.name.clone(),
+                            match_type: if c.match_any {
+                                crate::device::ZbfMatchType::Any
+                            } else {
+                                crate::device::ZbfMatchType::All
+                            },
+                            matches: c
+                                .matches
+                                .iter()
+                                .filter_map(|m| {
+                                    if let Some(p) = &m.protocol {
+                                        Some(crate::device::ZbfMatch::Protocol(p.clone()))
+                                    } else {
+                                        m.access_group.map(crate::device::ZbfMatch::AccessGroup)
+                                    }
+                                })
+                                .collect(),
+                        });
+                    }
+                    for p in &ds.zbf_policy_maps {
+                        rs.zbf_policy_maps.push(crate::device::ZbfPolicyMap {
+                            name: p.name.clone(),
+                            classes: p
+                                .classes
+                                .iter()
+                                .map(|c| crate::device::ZbfPolicyClass {
+                                    class_name: c.class_name.clone(),
+                                    is_default: c.is_default,
+                                    action: c.action.as_ref().map(|a| match a {
+                                        ZbfActionSummary::Inspect { parameter_map } => {
+                                            crate::device::ZbfAction::Inspect {
+                                                parameter_map: parameter_map.clone(),
+                                            }
+                                        }
+                                        ZbfActionSummary::Pass => crate::device::ZbfAction::Pass,
+                                        ZbfActionSummary::Drop { log } => {
+                                            crate::device::ZbfAction::Drop { log: *log }
+                                        }
+                                    }),
+                                    hits: c.hits,
+                                })
+                                .collect(),
+                        });
+                    }
+                    for z in &ds.zbf_zone_pairs {
+                        rs.zbf_zone_pairs.push(crate::device::ZbfZonePair {
+                            name: z.name.clone(),
+                            src_zone: z.src_zone.clone(),
+                            dst_zone: z.dst_zone.clone(),
+                            service_policy: z.service_policy.clone(),
                         });
                     }
                     for t in &ds.ipsec_tunnels {
@@ -1114,13 +1447,22 @@ impl Net {
                                     permit: r.permit,
                                     proto: match r.proto.as_str() {
                                         "icmp" => AclProto::Icmp,
+                                        "tcp" => AclProto::Tcp,
                                         _ => AclProto::Any,
                                     },
                                     src: ipv4_from_str(&r.src).unwrap_or(0),
                                     src_wildcard: ipv4_from_str(&r.src_wildcard).unwrap_or(0),
                                     dst: ipv4_from_str(&r.dst).unwrap_or(0),
                                     dst_wildcard: ipv4_from_str(&r.dst_wildcard).unwrap_or(0),
-                                    hits: 0,
+                                    src_port: r
+                                        .src_port
+                                        .as_deref()
+                                        .and_then(|p| p.parse::<u16>().ok()),
+                                    dst_port: r
+                                        .dst_port
+                                        .as_deref()
+                                        .and_then(|p| p.parse::<u16>().ok()),
+                                    hits: r.hits,
                                 })
                                 .collect(),
                         });
@@ -1128,6 +1470,15 @@ impl Net {
                 }
                 DeviceState::Switch(sw) => {
                     sw.dhcp_snooping = ds.dhcp_snooping;
+                    if let Some(p) = ds.stp_priority {
+                        sw.stp.priority = p;
+                    }
+                    sw.stp.enabled = ds.stp_enabled || ds.stp_priority.is_none();
+                    for (gid, sel) in &ds.lag_selected {
+                        if let Some(g) = sw.lags.get_mut(gid) {
+                            g.selected = sel.clone();
+                        }
+                    }
                     if let Some(v) = &ds.vxlan {
                         sw.vxlan.local = v.local.as_ref().and_then(|s| ipv4_from_str(s));
                         sw.vxlan.mappings = v.mappings.clone();
@@ -1471,6 +1822,41 @@ impl Net {
         true
     }
 
+    /// 删除 VLAN（`undo vlan <id>`）：VLAN 1 是默认 VLAN，不可删除。
+    /// 同步清理派生状态（SVI、ARP、MAC、待发帧、端口 PVID 与 Trunk 放行列表），
+    /// 避免留下悬空 VLAN 引用。状态仍只由本函数持有的 `DeviceState::Switch` 保存。
+    pub fn remove_vlan(&mut self, dev: DevId, vlan: VlanId) -> bool {
+        let Some(d) = self.device_mut(dev) else {
+            return false;
+        };
+        if vlan == DEFAULT_VLAN {
+            return false;
+        }
+        {
+            let DeviceState::Switch(sw) = &mut d.state else {
+                return false;
+            };
+            if !sw.vlans.contains(&vlan) {
+                return false;
+            }
+            sw.vlans.retain(|v| *v != vlan);
+            sw.svi.remove(&vlan);
+            sw.arp.retain(|(v, _), _| *v != vlan);
+            sw.arping.retain(|(v, _)| *v != vlan);
+            sw.mac_table.retain(|(v, _), _| *v != vlan);
+            sw.pending.retain(|f| f.vlan != Some(vlan));
+        }
+        for p in &mut d.ports {
+            if p.pvid == vlan {
+                p.pvid = DEFAULT_VLAN;
+            }
+            if let Some(list) = &mut p.trunk_allowed {
+                list.retain(|v| *v != vlan);
+            }
+        }
+        true
+    }
+
     pub fn set_svi(&mut self, dev: DevId, vlan: VlanId, ip: Option<Ipv4Addr>, prefix: u8) -> bool {
         let Some(d) = self.device_mut(dev) else {
             return false;
@@ -1544,6 +1930,28 @@ impl Net {
             src: RouteSrc::Static,
         });
         true
+    }
+
+    /// 撤销静态路由（`no ip route` / `undo ip route-static`）。
+    /// 与 `add_static_route` 用同一匹配键，保证写入/删除/显示一致。
+    pub fn remove_static_route(
+        &mut self,
+        dev: DevId,
+        dst: Ipv4Addr,
+        len: u8,
+        nexthop: Ipv4Addr,
+    ) -> bool {
+        let Some(d) = self.device_mut(dev) else {
+            return false;
+        };
+        let routes = match &mut d.state {
+            DeviceState::Router(rs) => &mut rs.static_routes,
+            DeviceState::Switch(sw) => &mut sw.static_routes,
+            _ => return false,
+        };
+        let before = routes.len();
+        routes.retain(|r| !(r.dst == dst && r.len == len && r.nexthop == nexthop));
+        routes.len() != before
     }
 
     pub fn set_host(&mut self, dev: DevId, ip: Option<Ipv4Addr>, prefix: u8, gw: Option<Ipv4Addr>) {

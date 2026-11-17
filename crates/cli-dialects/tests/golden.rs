@@ -264,11 +264,13 @@ fn vrp_config_flow_and_show() {
     let brief = exec_and_run(&mut eng, &mut sess, dev, "display ip interface brief");
     assert_eq!(
         brief,
+        // VRP 路由器接口默认非 shutdown（阶段 1 平台策略），未接线端口是
+        // "down" 而不是管理关闭的 "*down"；旧黄金把 IOS 默认套到了 VRP 上。
         "Interface                        IP Address/Mask     Physical  Protocol\n\
          GigabitEthernet0/0/0             10.0.0.1/24         down      down\n\
          GigabitEthernet0/0/1             192.168.1.1/24      down      down\n\
-         GigabitEthernet0/0/2             unassigned          *down     down\n\
-         GigabitEthernet0/0/3             unassigned          *down     down"
+         GigabitEthernet0/0/2             unassigned          down      down\n\
+         GigabitEthernet0/0/3             unassigned          down      down"
     );
     let table = exec_and_run(&mut eng, &mut sess, dev, "display ip routing-table");
     assert_eq!(

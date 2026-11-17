@@ -27,17 +27,17 @@ export const LABS_EN: Record<string, LabEn> = {
   'office-l3': {
     title: 'Lab 2 · Layer 3 Switch Inter-VLAN Routing (SVI)',
     brief:
-      'One Layer 3 switch carries two VLANs, with Vlanif10 / Vlanif20 configured as gateways to provide inter-VLAN routing. Experience VLAN isolation combined with Layer 3 reachability.',
+      'One Layer 3 switch carries two VLANs, with SVI gateways for VLAN10 / VLAN20 to provide inter-VLAN routing. Experience VLAN isolation combined with Layer 3 reachability.',
     tasks: [
-      'SW1: vlan batch 10 20',
-      'G0/0/1 -> access VLAN10 (to PC1); G0/0/2 -> access VLAN20 (to PC2)',
-      'interface Vlanif10 with 192.168.10.1/24; interface Vlanif20 with 192.168.20.1/24 (IOS: interface vlan 10)',
+      'SW1 (Comware V7): system-view -> vlan 10 -> quit -> vlan 20 -> quit',
+      'G1/0/1 (to PC1) / G1/0/2 (to PC2): interface g1/0/1 -> port link-type access -> port access vlan 10 -> quit -> interface g1/0/2 -> port link-type access -> port access vlan 20 -> quit',
+      'interface Vlan-interface 10 -> ip address 192.168.10.1 24 -> quit -> interface Vlan-interface 20 -> ip address 192.168.20.1 24 -> quit (IOS counterpart: interface vlan 10)',
       'PC1 gateway 192.168.10.1, PC2 gateway 192.168.20.1 (set them in the properties panel)',
-      'From PC1 ping 192.168.20.12 — this time it should succeed!',
+      'Verify with display vlan / display current-configuration; from PC1 ping 192.168.20.12 — this time it should succeed!',
     ],
     checkLabels: [
-      'Vlanif10 = 192.168.10.1',
-      'Vlanif20 = 192.168.20.1',
+      'VLAN10 SVI = 192.168.10.1',
+      'VLAN20 SVI = 192.168.20.1',
       'PC1 -> PC2 reachable across VLANs',
     ],
   },
@@ -46,7 +46,7 @@ export const LABS_EN: Record<string, LabEn> = {
     brief:
       'Two links between the switches form a loop. Observe how STP blocks one of them automatically and how the topology converges after a failure. BPDUs are visible in packet captures.',
     tasks: [
-      'After loading the topology wait 30 seconds (virtual time) for STP to converge, then run show spanning-tree on SW1 to inspect port roles',
+      'After loading the topology wait 30 seconds (virtual time) for STP to converge, then run display stp brief on SW1 (VRP) to inspect port roles',
       'Set the interconnect ports on both switches to trunk and allow VLAN10 (Huawei: port link-type trunk + allow-pass)',
       'Make SW1 the root bridge: system-view -> stp priority 4096 (IOS: spanning-tree vlan 1 priority 4096)',
       'Start a packet capture on one interconnect link and observe the BPDUs (one every 2 seconds)',
@@ -67,13 +67,13 @@ export const LABS_EN: Record<string, LabEn> = {
       'R1: g0/0 (LAN port) 192.168.1.1/24, g0/1 (WAN port) 202.100.1.1/24, both no shutdown',
       'R1: ip dhcp pool LAN -> network 192.168.1.0 255.255.255.0 -> default-router 192.168.1.1',
       'Enable DHCP automatic addressing in the PC1 properties panel -> it should obtain 192.168.1.2',
-      'R1: ip nat inside on g0/0, ip nat outside on g0/1; check translations with show ip nat translations',
+      'R1: ip nat inside on g0/0, ip nat outside on g0/1; verify the translation entries with show ip nat translations',
       '(Optional) access-list 100 deny icmp 192.168.1.0 0.0.0.255 202.100.1.0 0.0.0.255 plus interface application, to see the blocking in action',
-      'PC1 ping 202.100.1.100 — it works! Your traffic has been NATed to a public address',
+      'PC1 ping 202.100.1.100 — a reachability check only; a successful ping alone does not prove the traffic was NATed, judge the translation from show ip nat translations entries',
     ],
     checkLabels: [
       'PC1 obtained 192.168.1.2 via DHCP',
-      'PC1 -> Internet server reachable (NAT in effect)',
+      'PC1 -> Internet server reachable (after NAT configuration)',
       'R1 has a directly connected Internet subnet',
     ],
   },
@@ -108,7 +108,7 @@ export const LABS_EN: Record<string, LabEn> = {
       'R1: username admin privilege 15 secret Cisco@123',
       'R1: line vty 0 4 -> login local -> transport input ssh -> exit',
       'PC1 terminal: ssh 192.168.1.1 -> username admin, password Cisco@123 -> seeing R1# means the login succeeded',
-      'After logging in run show ip interface brief to inspect the R1 interfaces, then exit to disconnect',
+      'PC1 terminal: show ip interface brief -> exit (run on the remote device after login, then disconnect)',
       'PC1 terminal: telnet 192.168.1.1 — it should report connection refused (VTY allows SSH only)',
     ],
     checkLabels: [
@@ -182,7 +182,7 @@ export const LABS_EN: Record<string, LabEn> = {
       'CORE1 (IOS): g0/0 10.0.0.10/24 + vrrp 1 ip 10.0.0.1 + priority 200 + preempt + ip nat inside; g0/1 10.1.0.1/30; g0/2 203.0.113.1/24 + ip nat outside',
       'CORE1: ip route 192.168.0.0 255.255.0.0 10.0.0.2; router ospf 1 -> network 10.1.0.0 0.0.0.3 area 0',
       'CORE2 (IOS): g0/0 10.0.0.11/24 + vrrp 1 ip 10.0.0.1; g0/1 10.1.0.2/30; router ospf 1 -> network 10.1.0.0 0.0.0.3 area 0',
-      'Verify: display vrrp (CORE1 Master), show ip ospf neighbor (FULL), display eth-trunk 1 (2 Up); PC1 ping PC2/PC3/203.0.113.10',
+      'Verify (IOS CORE1/CORE2): show vrrp (CORE1 Master), show ip ospf neighbor (FULL); verify (VRP SW1/SW2): display eth-trunk 1 (2 Selected members); PC1 ping PC2/PC3/203.0.113.10',
     ],
     checkLabels: [
       'Both members of SW1 aggregation group 1 are selected',
@@ -196,24 +196,28 @@ export const LABS_EN: Record<string, LabEn> = {
     ],
   },
   'firewall-zone': {
-    title: 'Lab 10 · Firewall Security Zones and Policy',
+    title: 'Lab 10 · Firewall Security Zones and Security Policy',
     brief:
-      'An inside PC reaches an Internet server through a firewall. Put the two interfaces into trust / untrust zones and permit only trust -> untrust traffic; untrusted-initiated access is denied by default while replies are allowed by the stateful session.',
+      'An inside PC reaches an Internet server through a firewall. The baseline is the Huawei VRP security policy: interfaces are first put into the trust / untrust zones, then the trust->untrust zone pair is permitted. Traffic that matches no rule is dropped by the platform default policy (any/any -> deny), and same-zone traffic also needs a rule; the first packet creates a session entry, later packets hit the session table and are forwarded without re-checking the policy, so a policy change only takes effect on existing flows after the session table is cleared.',
     tasks: [
       'FW1: system-view -> interface g0/0/0 -> ip address 192.168.1.1 24 -> undo shutdown -> quit',
       'FW1: interface g0/0/1 -> ip address 203.0.113.1 24 -> undo shutdown -> quit',
-      'FW1: firewall zone trust -> add interface g0/0/0 -> quit (IOS: zone security INSIDE + interface zone-member security INSIDE)',
+      'FW1: firewall zone trust -> add interface g0/0/0 -> quit',
       'FW1: firewall zone untrust -> add interface g0/0/1 -> quit',
       'FW1: security-policy -> rule name allow-out -> source-zone trust -> destination-zone untrust -> action permit -> quit -> quit',
-      'FW1: display firewall zone and display security-policy to check zones and rules',
-      'SRV -> PC1 should fail first (untrusted-initiated access is denied); PC1 -> SRV should succeed with the reply allowed by the stateful session',
+      'FW1: return -> display firewall zone -> display security-policy -> display firewall session table (back in user view, check zone membership, rule STATE/ACTION and the session table)',
+      'SRV: ping 192.168.1.10 (should fail: no rule matches, the default policy drops it)',
+      'PC1: ping 203.0.113.10 (should succeed: allow-out matches; the reply is not re-checked against the policy, the session table lets it through)',
+      'FW1: system-view -> security-policy -> rule name allow-out -> disable -> quit -> quit -> return -> reset firewall session table (disable the rule and clear the table so existing flows stop immediately)',
+      'FW1: display security-policy -> display firewall session table (the rule STATE should be disable and the session table should be empty)',
+      'PC1: ping 203.0.113.10 (should now fail: new flows no longer match the disabled rule)',
     ],
     checkLabels: [
       'FW1 G0/0/0 is in the trust zone',
       'FW1 G0/0/1 is in the untrust zone',
-      'A trust -> untrust permit policy exists',
-      'SRV -> PC1 is denied by default',
-      'PC1 -> SRV is permitted (stateful reply)',
+      'An enabled trust -> untrust permit policy exists',
+      'SRV -> PC1 is denied by the default policy',
+      'PC1 -> SRV is permitted (reply via the session table)',
     ],
   },
 'ipsec-site': {
@@ -366,6 +370,23 @@ export const LABS_EN: Record<string, LabEn> = {
     ],
   },
 
+  'f5-ltm': {
+    title: 'Lab 19 · F5 BIG-IP TMOS 17.x LTM Load Balancing',
+    brief:
+      'A TMOS 17.x load balancer exposes VIP 10.0.0.100:80 in front of two pool members. TCP sessions to the VIP are distributed round-robin with destination/source translation. The first three steps are a strict, executable tmsh command sequence.',
+    tasks: [
+      'LB1 (tmsh root (tmos)#): ltm -> create pool WEB -> modify pool WEB members add { 10.0.1.10:80 } -> modify pool WEB members add { 10.0.2.11:80 }',
+      'create virtual VS destination 10.0.0.100:80 pool WEB -> list pool /Common/WEB -> list virtual /Common/VS -> exit',
+      'sys -> list version -> exit -> quit',
+      'PC1 gateway 10.0.0.1, SRV1 gateway 10.0.1.1, SRV2 gateway 10.0.2.1 (set them in the properties panel)',
+      'PC1: tcp 10.0.0.100 80 three times; use show ltm pool on LB1 to check that Sessions land on different Members',
+    ],
+    checkLabels: [
+      'LB1 virtual server VS = 10.0.0.100:80 (read-only)',
+      'Three TCP sessions actually land on different Members (active probe)',
+    ],
+  },
+
   'dc-comprehensive': {
     title: 'Lab 23 · Data Center Comprehensive (M-LAG + VXLAN + F5)',
     brief:
@@ -378,8 +399,8 @@ export const LABS_EN: Record<string, LabEn> = {
       'Underlay: DSW1 vlan 100 -> vlanif100 10.0.0.1/24 to SPINE G0/0/0 10.0.0.2/24; DSW2 vlan 100 -> vlanif100 10.0.1.2/24 to SPINE G0/0/1 10.0.1.1/24; DSW3 vlan 100 -> vlanif100 10.0.2.2/24 to SPINE G0/0/2 10.0.2.1/24 (all undo shutdown)',
       'Underlay routes: DSW1 ip route-static 10.0.1.0 24 and 10.0.2.0 24 both via 10.0.0.2; DSW2 both via 10.0.1.1; DSW3 both via 10.0.2.1. SPINE has only three connected segments — zero extra config',
       'VXLAN: DSW1 vxlan local 10.0.0.1 -> vni 10000 vlan 10 -> vxlan peer 10.0.2.2; DSW2 local 10.0.1.2 -> peer 10.0.2.2; DSW3 local 10.0.2.2 -> peer 10.0.0.1 -> peer 10.0.1.2 (DSW3 needs two peers)',
-      'Application delivery: F5 G0/0/0 192.168.10.254/24 to DSW3 (access VLAN10) -> G0/0/1 10.10.1.1/24 to SRV1 -> G0/0/2 10.10.2.1/24 to SRV2; ltm pool WEB member 10.10.1.10 80 and 10.10.2.10 80; ltm virtual VS vip 192.168.10.100 80 pool WEB',
-      'Verify: from DSW1 ping 10.0.2.2 should succeed (underlay across the SPINE); APP1 tcp 192.168.10.100 80 twice in a row should both succeed (F5 round-robin); display ltm should show two sessions',
+      'Application delivery: F5 G0/0/0 192.168.10.254/24 to DSW3 (access VLAN10) -> G0/0/1 10.10.1.1/24 to SRV1 -> G0/0/2 10.10.2.1/24 to SRV2; F5 (tmsh): ltm -> create pool WEB -> modify pool WEB members add { 10.10.1.10:80 } -> modify pool WEB members add { 10.10.2.10:80 } -> create virtual VS destination 192.168.10.100:80 pool WEB -> exit',
+      'Verify: from DSW1 ping 10.0.2.2 should succeed (underlay across the SPINE); APP1 tcp 192.168.10.100 80 twice in a row should both succeed (F5 round-robin); show ltm pool on F5 shows the session distribution',
     ],
     checkLabels: [
       'DSW1 has M-LAG domain 1',

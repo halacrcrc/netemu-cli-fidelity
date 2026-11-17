@@ -1,4 +1,10 @@
 //! 防火墙：区域划分、区域间策略、状态化放行。
+//!
+//! 阶段 6A：基线选择华为 VRP 安全策略。ASA 血统（`nameif` / `security-level` /
+//! 安全级别回退）已从命令树与数据面移除，由
+//! `security_golden::asa_lineage_commands_are_removed_and_have_no_data_plane`
+//! 的矩阵断言（原 `asa_security_level_default_policy` 改写）覆盖。
+//! §14.3 全表校准见 `tests/stage6a_firewall.rs`。
 
 use cli_dialects::{exec_and_run, prompt, trees};
 use cli_engine::{parse, Mode, Session};
@@ -100,7 +106,12 @@ fn vrp_firewall_zone_policy_stateful() {
     );
     let policy_show = exec_and_run(&mut eng, &mut s, fw, "display security-policy");
     assert!(policy_show.contains("allow-out"), "{}", policy_show);
-    assert!(policy_show.contains("action permit"), "{}", policy_show);
+    // 阶段 6A：输出改为官方列结构（RULE ID / RULE NAME / STATE / ACTION / HITS），
+    // 并追加平台缺省策略行；`action permit` 这种自造行不再存在。
+    assert!(policy_show.contains("RULE NAME"), "{}", policy_show);
+    assert!(policy_show.contains("STATE"), "{}", policy_show);
+    assert!(policy_show.contains("permit"), "{}", policy_show);
+    assert!(policy_show.contains("default"), "{}", policy_show);
 
     let mut pc_sess = Session::default();
     let tcp_open = exec_and_run(&mut eng, &mut pc_sess, pc, "tcp 203.0.113.10 80");
@@ -128,7 +139,17 @@ fn vrp_firewall_zone_policy_stateful() {
 
 #[test]
 fn ios_zone_pair_policy() {
-    let (mut eng, pc, fw, srv) = firewall_topo(Dialect::Ios);
+    // 阶段 6B：真实 IOS XE 17.x ZBF 路径（原 Stage 3B 教学抽象已移除）。
+    // 官方主线设备是路由器，这里用 DeviceKind::Router 验证。
+    let mut net = Net::new();
+    let pc = net.add_device("PC1".into(), DeviceKind::Host, Dialect::Ios);
+    let fw = net.add_device("R1".into(), DeviceKind::Router, Dialect::Ios);
+    let srv = net.add_device("SRV".into(), DeviceKind::Host, Dialect::Ios);
+    net.add_link(pc, fw).unwrap(); // R1 p0
+    net.add_link(fw, srv).unwrap(); // R1 p1
+    net.set_host(pc, Some(ip("192.168.1.10")), 24, Some(ip("192.168.1.1")));
+    net.set_host(srv, Some(ip("203.0.113.10")), 24, Some(ip("203.0.113.1")));
+    let mut eng = Engine::new(net);
     let mut s = Session::default();
     run(
         &mut eng,
@@ -147,25 +168,50 @@ fn ios_zone_pair_policy() {
             "no shutdown",
             "zone-member security OUTSIDE",
             "exit",
-            "zone-pair security IN-OUT",
-            "source INSIDE",
-            "destination OUTSIDE",
-            "action permit",
-            "exit",
             "end",
         ],
-        "FW1",
+        "R1",
     );
+    // 无 zone-pair：官方缺省 drop。
     assert_eq!(
         host_ping(&mut eng, srv, "192.168.1.10"),
         0,
-        "OUTSIDE→INSIDE 默认拒绝"
+        "OUTSIDE→INSIDE 缺省拒绝"
     );
     assert_eq!(
         host_ping(&mut eng, pc, "203.0.113.10"),
-        5,
-        "INSIDE→OUTSIDE 放行"
+        0,
+        "INSIDE→OUTSIDE 无策略拒绝"
     );
+
+    run(
+        &mut eng,
+        &mut s,
+        fw,
+        &[
+            "configure terminal",
+            "class-map type inspect match-any ICMP",
+            "match protocol icmp",
+            "exit",
+            "policy-map type inspect PMAP",
+            "class type inspect ICMP",
+            "inspect",
+            "exit",
+            "exit",
+            "zone-pair security IN-OUT source INSIDE destination OUTSIDE",
+            "service-policy type inspect PMAP",
+            "exit",
+            "end",
+        ],
+        "R1",
+    );
+    assert_eq!(host_ping(&mut eng, srv, "192.168.1.10"), 0, "反向仍拒绝");
+    assert_eq!(
+        host_ping(&mut eng, pc, "203.0.113.10"),
+        5,
+        "inspect 放行且回包走会话表"
+    );
+
     let zones = exec_and_run(&mut eng, &mut s, fw, "show zone security");
     assert!(
         zones.contains("INSIDE") && zones.contains("OUTSIDE"),
@@ -174,6 +220,7 @@ fn ios_zone_pair_policy() {
     );
     let pairs = exec_and_run(&mut eng, &mut s, fw, "show zone-pair security");
     assert!(pairs.contains("IN-OUT"), "{}", pairs);
+    assert!(pairs.contains("PMAP"), "{}", pairs);
 }
 
 #[test]
@@ -208,8 +255,42 @@ fn firewall_tcp_denied_without_policy() {
     assert!(out.contains("无响应"), "{}", out);
 }
 
+/// 原 `asa_security_level_default_policy`（断言「高级别→低级别默认放行」）改写为
+/// 落选血统矩阵：ASA 命令在基线方言上必须被拒绝，且旧存档里的
+/// `security_level` / `nameif` 字段**不得**产生任何隐式放行（不得保留无名共存）。
 #[test]
-fn asa_security_level_default_policy() {
+fn asa_lineage_commands_are_removed_and_have_no_data_plane() {
+    // 1) 命令树：ASA 命令在 IOS 树（含接口视图与配置视图）已不接受。
+    let t = trees(Dialect::Ios);
+    for (mode, line) in [
+        (Mode::If, "nameif inside"),
+        (Mode::If, "security-level 100"),
+        (Mode::Config, "nameif inside"),
+        (Mode::Config, "security-level 100"),
+    ] {
+        assert!(
+            !matches!(parse(t.root_for(mode), line), Ok(Some(_))),
+            "ASA 落选血统命令不得在 IOS 树共存: {} @ {:?}",
+            line,
+            mode
+        );
+    }
+    // VRP 树同样不得接受（基线没有安全级别概念）。
+    let tv = trees(Dialect::Vrp);
+    for (mode, line) in [
+        (Mode::If, "nameif inside"),
+        (Mode::If, "security-level 100"),
+    ] {
+        assert!(
+            !matches!(parse(tv.root_for(mode), line), Ok(Some(_))),
+            "ASA 命令不得混入 VRP 树: {} @ {:?}",
+            line,
+            mode
+        );
+    }
+
+    // 2) 数据面：把旧存档字段直接写进设备状态（模拟旧档），不做任何策略配置，
+    //    两侧都不得有「安全级别回退」带来的放行。
     let (mut eng, pc, fw, srv) = firewall_topo(Dialect::Ios);
     let mut s = Session::default();
     run(
@@ -222,28 +303,82 @@ fn asa_security_level_default_policy() {
             "interface g0/0",
             "ip address 192.168.1.1 255.255.255.0",
             "no shutdown",
-            "nameif inside",
-            "security-level 100",
             "exit",
             "interface g0/1",
             "ip address 203.0.113.1 255.255.255.0",
             "no shutdown",
-            "nameif outside",
-            "security-level 0",
+            "exit",
+            "end",
+        ],
+        "FW1",
+    );
+    if let Some(d) = eng.net.device_mut(fw) {
+        d.port_mut(0).unwrap().nameif = Some("inside".into());
+        d.port_mut(0).unwrap().security_level = Some(100);
+        d.port_mut(1).unwrap().nameif = Some("outside".into());
+        d.port_mut(1).unwrap().security_level = Some(0);
+    }
+    // 接口未划入任何安全区域：按显式平台策略（未划分区域直通）处理，这与
+    // ASA 安全级别回退无关；关键断言是「安全级别本身不再放行任何流量」。
+    assert_eq!(
+        host_ping(&mut eng, pc, "203.0.113.10"),
+        5,
+        "未划分区域按平台策略直通（不是安全级别放行）"
+    );
+    // 一旦划入区域，安全级别字段不得再让高→低放行。
+    run(
+        &mut eng,
+        &mut s,
+        fw,
+        &[
+            "configure terminal",
+            "interface g0/0",
+            "zone-member security INSIDE",
+            "exit",
+            "interface g0/1",
+            "zone-member security OUTSIDE",
             "exit",
             "end",
         ],
         "FW1",
     );
     assert_eq!(
+        host_ping(&mut eng, pc, "203.0.113.10"),
+        0,
+        "安全级别 100→0 不得再默认放行（ASA 回退语义已删除）"
+    );
+    assert_eq!(
         host_ping(&mut eng, srv, "192.168.1.10"),
         0,
-        "低级别→高级别默认拒绝"
+        "低→高同样默认拒绝"
+    );
+    // 只有显式 ZBF 策略才放行，证明 `security_level` 完全不再参与判定。
+    run(
+        &mut eng,
+        &mut s,
+        fw,
+        &[
+            "configure terminal",
+            "class-map type inspect match-any ANY",
+            "match protocol icmp",
+            "match protocol tcp",
+            "exit",
+            "policy-map type inspect PMAP",
+            "class type inspect ANY",
+            "inspect",
+            "exit",
+            "exit",
+            "zone-pair security IN-OUT source INSIDE destination OUTSIDE",
+            "service-policy type inspect PMAP",
+            "exit",
+            "end",
+        ],
+        "FW1",
     );
     assert_eq!(
         host_ping(&mut eng, pc, "203.0.113.10"),
         5,
-        "高级别→低级别默认放行"
+        "显式策略放行后连通"
     );
     let mut pcs = Session::default();
     let open = exec_and_run(&mut eng, &mut pcs, pc, "tcp 203.0.113.10 443");
@@ -368,23 +503,67 @@ fn firewall_commands_parse_in_all_dialects() {
     let cases: Vec<(Dialect, Mode, &str)> = vec![
         (Dialect::Ios, Mode::Config, "zone security INSIDE"),
         (Dialect::Ios, Mode::If, "zone-member security INSIDE"),
-        (Dialect::Ios, Mode::If, "nameif inside"),
-        (Dialect::Ios, Mode::If, "security-level 100"),
-        (Dialect::Ios, Mode::Config, "zone-pair security IN-OUT"),
-        (Dialect::Ios, Mode::SecurityRule, "source INSIDE"),
-        (Dialect::Ios, Mode::SecurityRule, "destination OUTSIDE"),
-        (Dialect::Ios, Mode::SecurityRule, "action permit"),
+        (Dialect::Ios, Mode::If, "no zone-member security INSIDE"),
+        (Dialect::Ios, Mode::Config, "no zone security INSIDE"),
+        (
+            Dialect::Ios,
+            Mode::Config,
+            "class-map type inspect match-any WEB",
+        ),
+        (Dialect::Ios, Mode::ClassMap, "match protocol icmp"),
+        (Dialect::Ios, Mode::ClassMap, "match access-group 100"),
+        (Dialect::Ios, Mode::Config, "policy-map type inspect PMAP"),
+        (Dialect::Ios, Mode::PolicyMap, "class type inspect WEB"),
+        (Dialect::Ios, Mode::PolicyMapClass, "inspect"),
+        (Dialect::Ios, Mode::PolicyMapClass, "pass"),
+        (Dialect::Ios, Mode::PolicyMapClass, "drop log"),
+        (
+            Dialect::Ios,
+            Mode::Config,
+            "zone-pair security IN-OUT source INSIDE destination OUTSIDE",
+        ),
+        (
+            Dialect::Ios,
+            Mode::SecurityRule,
+            "service-policy type inspect PMAP",
+        ),
+        (Dialect::Ios, Mode::Config, "no zone-pair security IN-OUT"),
+        (Dialect::Ios, Mode::Config, "no class-map WEB"),
+        (Dialect::Ios, Mode::Config, "no policy-map PMAP"),
         (Dialect::Ios, Mode::Exec, "show zone security"),
         (Dialect::Ios, Mode::Exec, "show zone-pair security"),
+        (
+            Dialect::Ios,
+            Mode::Exec,
+            "show policy-map type inspect zone-pair",
+        ),
         (Dialect::Vrp, Mode::Config, "firewall zone trust"),
         (Dialect::Vrp, Mode::Zone, "add interface g0/0/0"),
+        (Dialect::Vrp, Mode::Zone, "undo add interface g0/0/0"),
         (Dialect::Vrp, Mode::Config, "security-policy"),
         (Dialect::Vrp, Mode::SecurityPolicy, "rule name allow-out"),
+        (
+            Dialect::Vrp,
+            Mode::SecurityPolicy,
+            "rule move allow-out before deny-all",
+        ),
+        (
+            Dialect::Vrp,
+            Mode::SecurityPolicy,
+            "undo rule name allow-out",
+        ),
         (Dialect::Vrp, Mode::SecurityRule, "source-zone trust"),
         (Dialect::Vrp, Mode::SecurityRule, "destination-zone untrust"),
         (Dialect::Vrp, Mode::SecurityRule, "action permit"),
+        (Dialect::Vrp, Mode::SecurityRule, "enable"),
+        (Dialect::Vrp, Mode::SecurityRule, "disable"),
+        (Dialect::Vrp, Mode::SecurityRule, "undo source-zone"),
+        (Dialect::Vrp, Mode::SecurityRule, "undo destination-zone"),
+        (Dialect::Vrp, Mode::SecurityRule, "undo action"),
         (Dialect::Vrp, Mode::Exec, "display security-policy"),
         (Dialect::Vrp, Mode::Exec, "display firewall zone"),
+        (Dialect::Vrp, Mode::Exec, "display firewall session table"),
+        (Dialect::Vrp, Mode::Exec, "reset firewall session table"),
         (Dialect::Comware, Mode::Config, "security-zone name trust"),
         (Dialect::Comware, Mode::Zone, "import interface g1/0/1"),
         (Dialect::Comware, Mode::Config, "security-policy ip"),

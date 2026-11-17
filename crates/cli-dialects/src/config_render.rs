@@ -7,6 +7,17 @@ use crate::Dialect;
 use sim_core::device::{DeviceKind, PortMode};
 use sim_core::summary::DevSummary;
 
+/// 区域号 → 点分十进制（VRP area 视图写法，如 1 → 0.0.0.1）。
+fn area_to_dotted(area: u32) -> String {
+    format!(
+        "{}.{}.{}.{}",
+        (area >> 24) & 0xff,
+        (area >> 16) & 0xff,
+        (area >> 8) & 0xff,
+        area & 0xff
+    )
+}
+
 fn is_l3(kind: DeviceKind) -> bool {
     matches!(
         kind,
@@ -82,15 +93,14 @@ fn port_lines_ios(d: &DevSummary, out: &mut Vec<String>) {
         if let Some(acl) = p.acl_in {
             out.push(format!(" ip access-group {} in", acl));
         }
+        if let Some(acl) = p.acl_out {
+            out.push(format!(" ip access-group {} out", acl));
+        }
         if let Some(z) = &p.zone {
             out.push(format!(" zone-member security {}", z));
         }
-        if let Some(n) = &p.nameif {
-            out.push(format!(" nameif {}", n));
-        }
-        if let Some(l) = p.security_level {
-            out.push(format!(" security-level {}", l));
-        }
+        // 阶段 6A：ASA 血统的 `nameif` / `security-level` 不再渲染——命令已从树中
+        // 移除，渲染出来会产生无法重执行的配置行（旧存档字段仅作兼容保留）。
         if let Some(g) = p.lag {
             out.push(format!(" channel-group {} mode active", g));
         }
@@ -101,8 +111,12 @@ fn port_lines_ios(d: &DevSummary, out: &mut Vec<String>) {
     }
 }
 
+/// 非 IOS 接口段。VRP 与 Comware 的 L2 字面量必须分开渲染（阶段 4A）：
+/// `port default vlan` / `allow-pass` 只属于 VRP，
+/// `port access vlan` / `permit` 只属于 Comware（官方 E1/E2/E3/E10）。
 fn port_lines_vrp(d: &DevSummary, dialect: Dialect, out: &mut Vec<String>) {
     let l3 = is_l3(d.kind);
+    let comware = dialect == Dialect::Comware;
     for p in &d.ports {
         out.push(format!(
             "interface {}",
@@ -118,20 +132,28 @@ fn port_lines_vrp(d: &DevSummary, dialect: Dialect, out: &mut Vec<String>) {
             match p.mode {
                 PortMode::Access => {
                     out.push(" port link-type access".into());
-                    out.push(format!(" port default vlan {}", p.pvid));
+                    if comware {
+                        out.push(format!(" port access vlan {}", p.pvid));
+                    } else {
+                        out.push(format!(" port default vlan {}", p.pvid));
+                    }
                 }
                 PortMode::Trunk => {
                     out.push(" port link-type trunk".into());
                     if let Some(list) = &p.trunk_allowed {
                         let vs: Vec<String> = list.iter().map(|v| v.to_string()).collect();
-                        out.push(format!(" port trunk allow-pass vlan {}", vs.join(" ")));
+                        if comware {
+                            out.push(format!(" port trunk permit vlan {}", vs.join(" ")));
+                        } else {
+                            out.push(format!(" port trunk allow-pass vlan {}", vs.join(" ")));
+                        }
                     }
                 }
             }
         }
-        if let Some(z) = &p.zone {
-            out.push(format!(" firewall zone {}", z));
-        }
+        // 阶段 6A：安全区域成员关系不再塞进接口视图。
+        // `firewall zone <name>` 是系统视图命令（V5），放在接口视图里无法重执行；
+        // 区域块由 `security_zone_lines()` 在系统视图下独立渲染。
         if !p.admin_up {
             out.push(" shutdown".into());
         }
@@ -139,15 +161,166 @@ fn port_lines_vrp(d: &DevSummary, dialect: Dialect, out: &mut Vec<String>) {
     }
 }
 
+/// 阶段 6A：安全区域与安全策略的可重执行渲染片段。
+///
+/// - VRP 基线：`firewall zone <name>` → `add interface <if>` → `quit`；
+///   `security-policy` → `rule name <n>` → `source-zone` / `destination-zone` /
+///   `action` /（禁用时）`disable` → `quit` → `quit`。
+/// - IOS：`zone security <name>` → `exit`（成员关系在接口视图 `zone-member`）；
+///   `zone-pair security <n>` → `source` / `destination` / `action` → `exit`。
+/// - Comware：安全区域/策略仍属 Stage 4A 边界（安全数据面不在本包），
+///   这里不渲染任何 Comware 安全配置，避免冒充未实现的能力。
+fn security_lines(d: &DevSummary, dialect: Dialect, out: &mut Vec<String>) {
+    match dialect {
+        Dialect::Comware | Dialect::Tmos => (),
+        Dialect::Ios => {
+            for z in &d.security_zones {
+                out.push(format!("zone security {}", z.name));
+                out.push(" exit".into());
+            }
+            // 阶段 6B：ZBF class-map → policy-map → zone-pair，逐行可重执行。
+            for cm in &d.zbf_class_maps {
+                out.push(format!(
+                    "class-map type inspect {} {}",
+                    if cm.match_any {
+                        "match-any"
+                    } else {
+                        "match-all"
+                    },
+                    cm.name
+                ));
+                for m in &cm.matches {
+                    if let Some(p) = &m.protocol {
+                        out.push(format!(" match protocol {p}"));
+                    } else if let Some(n) = m.access_group {
+                        out.push(format!(" match access-group {n}"));
+                    }
+                }
+                out.push(" exit".into());
+            }
+            for pm in &d.zbf_policy_maps {
+                out.push(format!("policy-map type inspect {}", pm.name));
+                for cl in &pm.classes {
+                    if cl.is_default {
+                        out.push(" class class-default".into());
+                    } else {
+                        out.push(format!(" class type inspect {}", cl.class_name));
+                    }
+                    match &cl.action {
+                        Some(sim_core::summary::ZbfActionSummary::Inspect { parameter_map }) => {
+                            match parameter_map {
+                                Some(p) => out.push(format!("  inspect {p}")),
+                                None => out.push("  inspect".into()),
+                            }
+                        }
+                        Some(sim_core::summary::ZbfActionSummary::Pass) => {
+                            out.push("  pass".into())
+                        }
+                        Some(sim_core::summary::ZbfActionSummary::Drop { log }) => {
+                            out.push(if *log {
+                                "  drop log".into()
+                            } else {
+                                "  drop".into()
+                            })
+                        }
+                        None => {}
+                    }
+                    out.push("  exit".into());
+                }
+                out.push(" exit".into());
+            }
+            for z in &d.zbf_zone_pairs {
+                out.push(format!(
+                    "zone-pair security {} source {} destination {}",
+                    z.name, z.src_zone, z.dst_zone
+                ));
+                if let Some(p) = &z.service_policy {
+                    out.push(format!(" service-policy type inspect {p}"));
+                }
+                out.push(" exit".into());
+            }
+        }
+        Dialect::Vrp => {
+            for z in &d.security_zones {
+                out.push(format!("firewall zone {}", z.name));
+                for p in d
+                    .ports
+                    .iter()
+                    .filter(|p| p.zone.as_deref() == Some(&z.name))
+                {
+                    out.push(format!(
+                        " add interface {}",
+                        ifname::canonical(dialect, d.kind, p.idx)
+                    ));
+                }
+                out.push(" quit".into());
+            }
+            if !d.security_policies.is_empty() {
+                out.push("security-policy".into());
+                for p in &d.security_policies {
+                    out.push(format!(" rule name {}", p.name));
+                    out.push(format!("  source-zone {}", p.src_zone));
+                    out.push(format!("  destination-zone {}", p.dst_zone));
+                    out.push(format!(
+                        "  action {}",
+                        if p.permit { "permit" } else { "deny" }
+                    ));
+                    if !p.enabled {
+                        out.push("  disable".into());
+                    }
+                    out.push("  quit".into());
+                }
+                out.push(" quit".into());
+            }
+        }
+    }
+}
+
+/// 阶段 5A：TMOS 17.x / tmsh 风格配置视图。
+/// 每行都是 root 模块 `(tmos)#` 下可逐行重执行的官方完整路径命令（F1/F2/F3），
+/// 对象一律用 `/Common/` 全路径（F6）。不是逐字厂商输出黄金。
+pub fn render_tmos(d: &DevSummary) -> String {
+    let mut out: Vec<String> = Vec::new();
+    if let Some(ltm) = &d.ltm {
+        for pool in &ltm.pools {
+            out.push(format!("create ltm pool /Common/{}", pool.name));
+            for (ip, port) in &pool.members {
+                out.push(format!(
+                    "modify ltm pool /Common/{} members add {{ {}:{} }}",
+                    pool.name, ip, port
+                ));
+            }
+        }
+        for v in &ltm.virtuals {
+            out.push(format!(
+                "create ltm virtual /Common/{} destination {}:{} pool /Common/{}",
+                v.name, v.vip, v.port, v.pool
+            ));
+        }
+    }
+    out.join("\n")
+}
+
 /// 生成 running/current 配置文本（按方言风格）。
+/// 阶段 5A：TMOS 走独立 `render_tmos`，不复用任何华为/IOS 风格段落。
 pub fn render(d: &DevSummary, dialect: Dialect) -> String {
+    if dialect == Dialect::Tmos {
+        return render_tmos(d);
+    }
     let mut out: Vec<String> = Vec::new();
     match dialect {
         Dialect::Ios => out.push(format!("hostname {}", d.name)),
         _ => out.push(format!("sysname {}", d.name)),
     }
-    // VLAN（从端口与 SVI 收集）
-    let vlans = vlans_of(d);
+    // VLAN（从端口与 SVI 收集）。
+    // 阶段 6A：只有具备二层交换端口的设备才渲染 VLAN 配置；路由器/防火墙的物理口
+    // pvid 恒为缺省 VLAN 1，渲染 `vlan batch 1` 会得到不可重执行的配置行
+    // （`vlan batch` 只在交换设备上有效）。
+    let vlans = if matches!(d.kind, DeviceKind::Switch | DeviceKind::AccessPoint) {
+        vlans_of(d)
+    } else {
+        Vec::new()
+    };
     if !vlans.is_empty() {
         match dialect {
             Dialect::Ios => {
@@ -155,17 +328,31 @@ pub fn render(d: &DevSummary, dialect: Dialect) -> String {
                     out.push(format!("vlan {}", v));
                 }
             }
-            _ => {
+            Dialect::Vrp => {
                 let vs: Vec<String> = vlans.iter().map(|v| v.to_string()).collect();
                 out.push(format!("vlan batch {}", vs.join(" ")));
             }
+            // E1/E3：Comware 官方配置文件每个 VLAN 一行 `vlan <id>`；
+            // `vlan batch` 是 VRP 专属，绝不输出给 Comware。
+            // E1/E11：`vlan <id>` 会进入 VLAN 视图，故每条后补 `quit` 退回系统视图，
+            // 保证 `display current-configuration` 的输出可逐行重执行还原同一状态。
+            Dialect::Comware => {
+                for v in &vlans {
+                    out.push(format!("vlan {}", v));
+                    out.push(" quit".into());
+                }
+            }
+            Dialect::Tmos => unreachable!("render_tmos 已提前返回"),
         }
     }
     // 接口
     match dialect {
         Dialect::Ios => port_lines_ios(d, &mut out),
-        _ => port_lines_vrp(d, dialect, &mut out),
+        Dialect::Vrp | Dialect::Comware => port_lines_vrp(d, dialect, &mut out),
+        Dialect::Tmos => unreachable!("render_tmos 已提前返回"),
     }
+    // 阶段 6A：安全区域与安全策略（必须在接口段之后，区域成员引用接口名）。
+    security_lines(d, dialect, &mut out);
     // SVI
     for s in &d.svis {
         match dialect {
@@ -174,7 +361,8 @@ pub fn render(d: &DevSummary, dialect: Dialect) -> String {
                     "interface {}",
                     ifname::svi_canonical(Dialect::Ios, s.vlan)
                 ));
-                out.push(format!(" ip address {} {}", s.ip, s.prefix));
+                let mask = sim_packets::ipv4_str(sim_packets::mask_from_prefix(s.prefix));
+                out.push(format!(" ip address {} {}", s.ip, mask));
                 if !s.admin_up {
                     out.push(" shutdown".into());
                 }
@@ -196,7 +384,10 @@ pub fn render(d: &DevSummary, dialect: Dialect) -> String {
     // 静态路由
     for r in &d.static_routes {
         match dialect {
-            Dialect::Ios => out.push(format!("ip route {} {} {}", r.dst, r.len, r.nexthop)),
+            Dialect::Ios => {
+                let mask = sim_packets::ipv4_str(sim_packets::mask_from_prefix(r.len));
+                out.push(format!("ip route {} {} {}", r.dst, mask, r.nexthop));
+            }
             _ => out.push(format!("ip route-static {} {} {}", r.dst, r.len, r.nexthop)),
         }
     }
@@ -209,22 +400,38 @@ pub fn render(d: &DevSummary, dialect: Dialect) -> String {
             )),
         }
     }
-    // OSPF（v4）
+    // OSPF（v4）：进程号与区域从真实状态取值，不再硬编码 1 / area 0。
     if !d.ospf_networks.is_empty() {
+        let process = d.ospf_process.unwrap_or(1);
+        let area = d.ospf_area;
+        let area_ip = area_to_dotted(area);
         match dialect {
             Dialect::Ios => {
-                out.push("router ospf 1".into());
+                out.push(format!("router ospf {}", process));
+                for (net, wc) in &d.ospf_networks {
+                    out.push(format!(" network {} {} area {}", net, wc, area));
+                }
+            }
+            Dialect::Vrp => {
+                out.push(format!("ospf {}", process));
+                out.push(format!(" area {}", area_ip));
                 for (net, wc) in &d.ospf_networks {
                     out.push(format!(" network {} {}", net, wc));
                 }
+                out.push(" quit".into());
             }
-            _ => {
-                out.push("ospf 1".into());
-                out.push(" area 0".into());
+            // E6/E8：Comware 的 `network` 只在 OSPF 区域视图有效；quit 逐层退出，
+            // 两次 quit 才能回到系统视图（区域 → 进程 → 系统），保证渲染文本可重执行。
+            Dialect::Comware => {
+                out.push(format!("ospf {}", process));
+                out.push(format!(" area {}", area_ip));
                 for (net, wc) in &d.ospf_networks {
                     out.push(format!(" network {} {}", net, wc));
                 }
+                out.push(" quit".into());
+                out.push(" quit".into());
             }
+            Dialect::Tmos => unreachable!("render_tmos 已提前返回"),
         }
     }
     // OSPFv3
@@ -234,72 +441,247 @@ pub fn render(d: &DevSummary, dialect: Dialect) -> String {
             _ => out.push("ospfv3 1".into()),
         }
     }
-    // BGP
+    // Route-Policy / Route-Map：节点按 seq 升序渲染真实匹配与 apply 属性。
+    for rp in &d.route_policies {
+        let mut nodes: Vec<&sim_core::summary::RoutePolicyNodeSummary> = rp.nodes.iter().collect();
+        nodes.sort_by_key(|n| n.seq);
+        for n in nodes {
+            let action = if n.permit { "permit" } else { "deny" };
+            match dialect {
+                Dialect::Ios => {
+                    out.push(format!("route-map {} {} {}", rp.name, action, n.seq));
+                    if let Some(acl) = n.match_acl {
+                        out.push(format!(" match ip address {}", acl));
+                    }
+                    if let Some(lp) = n.set_local_pref {
+                        out.push(format!(" set local-preference {}", lp));
+                    }
+                }
+                _ => {
+                    out.push(format!(
+                        "route-policy {} {} node {}",
+                        rp.name, action, n.seq
+                    ));
+                    if let Some(acl) = n.match_acl {
+                        out.push(format!(" if-match acl {}", acl));
+                    }
+                    if let Some(lp) = n.set_local_pref {
+                        out.push(format!(" apply local-preference {}", lp));
+                    }
+                    out.push(" quit".into());
+                }
+            }
+        }
+    }
+    // BGP：本端 AS、邻居 AS/地址、network 与邻居策略均取真实状态，按方言用词。
     if let Some(asn) = d.bgp_asn {
         match dialect {
             Dialect::Ios => out.push(format!("router bgp {}", asn)),
             _ => out.push(format!("bgp {}", asn)),
         }
         for (ip, ra) in &d.bgp_neighbors {
-            out.push(format!(" neighbor {} as-number {}", ip, ra));
+            match dialect {
+                Dialect::Ios => out.push(format!(" neighbor {} remote-as {}", ip, ra)),
+                _ => out.push(format!(" peer {} as-number {}", ip, ra)),
+            }
         }
         for (net, len) in &d.bgp_networks {
             let mask = sim_packets::ipv4_str(sim_packets::mask_from_prefix(*len));
-            out.push(format!(" network {} {}", net, mask));
+            match dialect {
+                Dialect::Ios => out.push(format!(" network {} mask {}", net, mask)),
+                _ => out.push(format!(" network {} {}", net, mask)),
+            }
+        }
+        for (ip, import, name) in &d.bgp_peer_policies {
+            match dialect {
+                Dialect::Ios => {
+                    let dir = if *import { "in" } else { "out" };
+                    out.push(format!(" neighbor {} route-map {} {}", ip, name, dir));
+                }
+                _ => {
+                    let dir = if *import { "import" } else { "export" };
+                    out.push(format!(" peer {} route-policy {} {}", ip, name, dir));
+                }
+            }
+        }
+        if !matches!(dialect, Dialect::Ios) {
+            out.push(" quit".into());
         }
     }
-    // DHCP pool
+    // DHCP pool：按实际方言渲染，VRP 不得套用 IOS 的 `ip dhcp pool`/`default-router`。
+    for (low, high) in &d.dhcp_excluded {
+        out.push(format!("ip dhcp excluded-address {} {}", low, high));
+    }
     for pool in &d.dhcp_pools {
         let mask = sim_packets::ipv4_str(sim_packets::mask_from_prefix(pool.prefix));
-        out.push(format!("ip dhcp pool {}", pool.name));
-        out.push(format!(" network {} {}", pool.network, mask));
         match dialect {
-            Dialect::Ios => out.push(format!(" default-router {}", pool.gateway)),
-            _ => out.push(format!(" gateway {}", pool.gateway)),
+            Dialect::Ios => {
+                out.push(format!("ip dhcp pool {}", pool.name));
+                out.push(format!(" network {} {}", pool.network, mask));
+                out.push(format!(" default-router {}", pool.gateway));
+                if pool.dns != "0.0.0.0" {
+                    out.push(format!(" dns-server {}", pool.dns));
+                }
+            }
+            _ => {
+                out.push(format!("ip pool {}", pool.name));
+                out.push(format!(" network {} mask {}", pool.network, mask));
+                out.push(format!(" gateway-list {}", pool.gateway));
+                if pool.dns != "0.0.0.0" {
+                    out.push(format!(" dns-list {}", pool.dns));
+                }
+            }
         }
     }
-    // ACL（占位行：规则细节以 show access-lists / display acl 呈现）
+    for idx in &d.dhcp_server_ports {
+        out.push(format!(
+            "interface {}",
+            ifname::canonical(dialect, d.kind, *idx)
+        ));
+        out.push(" dhcp select global".into());
+        out.push(match dialect {
+            Dialect::Ios => " exit".into(),
+            _ => " quit".into(),
+        });
+    }
+    // ACL：只渲染真实规则与端口，不再输出占位行。
     for acl in &d.acls {
         match dialect {
-            Dialect::Ios => out.push(format!("access-list {}", acl.number)),
-            _ => out.push(format!("acl {}", acl.number)),
+            Dialect::Ios => {
+                for r in &acl.rules {
+                    let action = if r.permit { "permit" } else { "deny" };
+                    let proto = match r.proto.as_str() {
+                        "icmp" => "icmp ",
+                        "tcp" => "tcp ",
+                        _ => "ip ",
+                    };
+                    let mut line = format!(
+                        "access-list {} {} {}{} {}",
+                        acl.number, action, proto, r.src, r.src_wildcard
+                    );
+                    if r.dst != "0.0.0.0" || r.dst_wildcard != "0.0.0.0" {
+                        line.push_str(&format!(" {} {}", r.dst, r.dst_wildcard));
+                    }
+                    if let Some(p) = &r.src_port {
+                        line.push_str(&format!(" eq {}", p));
+                    }
+                    if let Some(p) = &r.dst_port {
+                        line.push_str(&format!(" eq {}", p));
+                    }
+                    out.push(line);
+                }
+            }
+            _ => {
+                out.push(format!("acl number {}", acl.number));
+                for (i, r) in acl.rules.iter().enumerate() {
+                    let action = if r.permit { "permit" } else { "deny" };
+                    let proto = match r.proto.as_str() {
+                        "icmp" => " icmp",
+                        "tcp" => " tcp",
+                        _ => "",
+                    };
+                    let mut line = format!(
+                        " rule {} {}{} source {} {}",
+                        5 + i as u32 * 5,
+                        action,
+                        proto,
+                        r.src,
+                        r.src_wildcard
+                    );
+                    if r.dst != "0.0.0.0" || r.dst_wildcard != "0.0.0.0" {
+                        line.push_str(&format!(" destination {} {}", r.dst, r.dst_wildcard));
+                    }
+                    if let Some(p) = &r.dst_port {
+                        line.push_str(&format!(" destination-port eq {}", p));
+                    }
+                    out.push(line);
+                }
+            }
         }
     }
-    // NAT
-    for idx in &d.nat_inside {
+    // NAT：接口名按真实方言/设备类型派生，角色与静态映射从真实状态渲染。
+    for (inside, idx) in d
+        .nat_inside
+        .iter()
+        .map(|i| (true, i))
+        .chain(d.nat_outside.iter().map(|i| (false, i)))
+    {
+        match dialect {
+            Dialect::Ios => {
+                out.push(format!(
+                    "interface {}",
+                    ifname::canonical(Dialect::Ios, d.kind, *idx)
+                ));
+                out.push(if inside {
+                    " ip nat inside".into()
+                } else {
+                    " ip nat outside".into()
+                });
+                out.push(" exit".into());
+            }
+            _ => {
+                out.push(format!(
+                    "interface {}",
+                    ifname::canonical(dialect, d.kind, *idx)
+                ));
+                out.push(if inside {
+                    " nat inbound".into()
+                } else {
+                    " nat outbound".into()
+                });
+                out.push(" quit".into());
+            }
+        }
+    }
+    for (inside, outside) in &d.nat_static {
         match dialect {
             Dialect::Ios => out.push(format!(
-                "interface GigabitEthernet0/0/{} nat inside",
-                idx + 1
+                "ip nat inside source static {} {}",
+                inside, outside
             )),
-            _ => out.push(format!(
-                "interface GigabitEthernet0/0/{} nat inbound",
-                idx + 1
-            )),
+            _ => out.push(format!("nat static global {} inside {}", outside, inside)),
         }
     }
-    for idx in &d.nat_outside {
+    if let Some((acl, _port)) = d.nat_easyip {
         match dialect {
             Dialect::Ios => out.push(format!(
-                "interface GigabitEthernet0/0/{} nat outside",
-                idx + 1
+                "ip nat inside source list {} interface {} overload",
+                acl,
+                ifname::canonical(
+                    Dialect::Ios,
+                    d.kind,
+                    d.nat_outside.first().copied().unwrap_or(0)
+                )
             )),
-            _ => out.push(format!(
-                "interface GigabitEthernet0/0/{} nat outbound",
-                idx + 1
-            )),
+            _ => out.push(format!("nat outbound {}", acl)),
         }
     }
-    // mgmt：本地用户与 VTY
-    if !d.mgmt.users.is_empty() || d.mgmt.auth_local {
+    // mgmt：本地用户与 VTY（口令一律脱敏，不输出明文）
+    if dialect == Dialect::Ios && d.mgmt.enable_secret.is_some() {
+        out.push("enable secret ***".into());
+    }
+    if !d.mgmt.users.is_empty()
+        || d.mgmt.auth_local
+        || d.mgmt.effective_line_auth() != sim_core::device::LineAuthMode::None
+    {
         match dialect {
             Dialect::Ios => {
                 for u in &d.mgmt.users {
-                    out.push(format!("username {} privilege 15 secret ***", u.name));
+                    out.push(format!(
+                        "username {} privilege {} secret ***",
+                        u.name, u.privilege
+                    ));
                 }
                 out.push("line vty 0 4".into());
-                if d.mgmt.auth_local {
-                    out.push(" login local".into());
+                match d.mgmt.effective_line_auth() {
+                    sim_core::device::LineAuthMode::None => {}
+                    sim_core::device::LineAuthMode::Line => {
+                        out.push(" login".into());
+                        if d.mgmt.line_password.is_some() {
+                            out.push(" password ***".into());
+                        }
+                    }
+                    sim_core::device::LineAuthMode::Local => out.push(" login local".into()),
                 }
                 match d.mgmt.transport {
                     sim_core::device::VtyTransport::Ssh => out.push(" transport input ssh".into()),
@@ -332,21 +714,78 @@ pub fn render(d: &DevSummary, dialect: Dialect) -> String {
             }
         }
     }
-    // VRRP
+    // VRRP：真实接口名 + 真实优先级/抢占，不再输出占位拼接行。
     for g in &d.vrrp {
         match dialect {
-            Dialect::Ios => out.push(format!(
-                "interface GigabitEthernet0/0/{}: vrrp {} ip {}",
-                g.port + 1,
-                g.vrid,
-                g.vip
-            )),
-            _ => out.push(format!(
-                "interface GigabitEthernet0/0/{}: vrrp vrid {} virtual-ip {}",
-                g.port + 1,
-                g.vrid,
-                g.vip
-            )),
+            Dialect::Ios => {
+                out.push(format!(
+                    "interface {}",
+                    ifname::canonical(Dialect::Ios, d.kind, g.port)
+                ));
+                out.push(format!(" vrrp {} ip {}", g.vrid, g.vip));
+                out.push(format!(" vrrp {} priority {}", g.vrid, g.priority));
+                if g.preempt {
+                    out.push(format!(" vrrp {} preempt", g.vrid));
+                }
+                out.push(" exit".into());
+            }
+            _ => {
+                out.push(format!(
+                    "interface {}",
+                    ifname::canonical(dialect, d.kind, g.port)
+                ));
+                out.push(format!(" vrrp vrid {} virtual-ip {}", g.vrid, g.vip));
+                out.push(format!(" vrrp vrid {} priority {}", g.vrid, g.priority));
+                if g.preempt {
+                    out.push(format!(" vrrp vrid {} preempt-mode timer delay 0", g.vrid));
+                }
+                out.push(" quit".into());
+            }
+        }
+    }
+    // STP（H2）与 Eth-Trunk（H3）：从真实配置渲染。
+    if let Some(priority) = d.stp_priority {
+        if !d.stp_enabled {
+            out.push(match dialect {
+                Dialect::Ios => "no spanning-tree vlan 1".into(),
+                _ => "stp disable".into(),
+            });
+        } else {
+            out.push(match dialect {
+                Dialect::Ios => format!("spanning-tree vlan 1 priority {}", priority),
+                _ => format!("stp priority {}", priority),
+            });
+        }
+    }
+    for g in &d.lags {
+        match dialect {
+            Dialect::Ios => {
+                out.push(format!("interface Port-channel{}", g.id));
+                out.push(if matches!(g.mode, sim_core::device::LagMode::Static) {
+                    " channel-group mode on".into()
+                } else {
+                    " channel-group mode active".into()
+                });
+                out.push(" exit".into());
+            }
+            Dialect::Vrp => {
+                out.push(format!("interface Eth-Trunk{}", g.id));
+                out.push(match g.mode {
+                    sim_core::device::LagMode::Static => " mode manual load-balance".into(),
+                    _ => " mode lacp-static".into(),
+                });
+                out.push(" quit".into());
+            }
+            // E1/E3：Comware 聚合口是 Bridge-Aggregation，模式为 link-aggregation mode。
+            Dialect::Comware => {
+                out.push(format!("interface Bridge-Aggregation{}", g.id));
+                out.push(match g.mode {
+                    sim_core::device::LagMode::Static => " link-aggregation mode static".into(),
+                    _ => " link-aggregation mode dynamic".into(),
+                });
+                out.push(" quit".into());
+            }
+            Dialect::Tmos => unreachable!("render_tmos 已提前返回"),
         }
     }
     // VXLAN / EVPN
@@ -369,20 +808,9 @@ pub fn render(d: &DevSummary, dialect: Dialect) -> String {
             out.push(format!("evpn peer {}", peer));
         }
     }
-    // LTM
-    if let Some(ltm) = &d.ltm {
-        for pool in &ltm.pools {
-            for (ip, port) in &pool.members {
-                out.push(format!("ltm pool {} member {} {}", pool.name, ip, port));
-            }
-        }
-        for v in &ltm.virtuals {
-            out.push(format!(
-                "ltm virtual {} vip {} {} pool {}",
-                v.name, v.vip, v.port, v.pool
-            ));
-        }
-    }
+    // 阶段 5A：抽象 `ltm pool ...` / `ltm virtual ...` 已从 IOS/VRP/Comware 三棵树
+    // 移除，这里不再为任何非 Tmos 设备渲染这些不可重放的跨厂商伪装命令；
+    // TMOS 由 `render_tmos` 在 render() 开头独立输出 tmsh 风格文本。
     // M-LAG / 堆叠
     if let Some(m) = &d.mlag {
         out.push(format!("mlag domain {}", m.domain));
@@ -411,12 +839,7 @@ pub fn render(d: &DevSummary, dialect: Dialect) -> String {
     for r in &d.srv6_routes {
         out.push(format!("srv6 route {}/{} sid {}", r.dst, r.len, r.sid));
     }
-    // 防火墙策略
-    for sp in &d.security_policies {
-        out.push(format!(
-            "security-policy rule {} {} -> {} permit={}",
-            sp.name, sp.src_zone, sp.dst_zone, sp.permit
-        ));
-    }
+    // 阶段 6A：这里原本输出的 `security-policy rule <n> <src> -> <dst> permit=` 是
+    // 不可重执行的伪命令（三方言共用），已由 `security_lines()` 的基线分叉渲染替代。
     out.join("\n")
 }

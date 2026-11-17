@@ -1,10 +1,21 @@
 <script lang="ts">
   // 左侧面板：设备库、属性编辑、链路抓包、实验卡、示例任务卡。
-  import { getSim, dumpSummary } from '../lib/sim';
+  import { getSim, dumpSummary, loadWithReport } from '../lib/sim';
   import { app, deviceById, refreshFrom, openTerminal, setLabTitle, setLabChecks, markLabPassed, resetPositions, setPosition, setView } from '../lib/store.svelte';
-  import { markDirty, currentWorkspace, exportFile, importFile } from '../lib/persistence';
+  import { markDirty, currentWorkspace, exportFile, importFile, LOAD_RESET_NOTICE, takeLoadNotices } from '../lib/persistence';
   import { buildShareUrl } from '../lib/share';
-  import { LABS, applyLab, runLabChecks, labTitle, labBrief, labTasks, type LabDef } from '../lib/labs';
+  import {
+    LABS,
+    applyLab,
+    runLabChecks,
+    labTitle,
+    labBrief,
+    labTasks,
+    labActiveBehaviors,
+    labHasActiveChecks,
+    labHasReadOnlyChecks,
+    type LabDef,
+  } from '../lib/labs';
   import { t } from '../lib/i18n.svelte';
 
   (window as unknown as { __appComp?: unknown }).__appComp = app;
@@ -17,11 +28,11 @@
     | 'WlanController'
     | 'LoadBalancer'
   >('Router');
-  let newDialect = $state<'Ios' | 'Vrp' | 'Comware'>('Ios');
+  let newDialect = $state<'Ios' | 'Vrp' | 'Comware' | 'Tmos'>('Ios');
 
   // 属性编辑的本地副本
   let editName = $state('');
-  let editDialect = $state<'Ios' | 'Vrp' | 'Comware'>('Ios');
+  let editDialect = $state<'Ios' | 'Vrp' | 'Comware' | 'Tmos'>('Ios');
   let editIp = $state('');
   let editPrefix = $state(24);
   let editGw = $state('');
@@ -268,7 +279,13 @@
   }
   function dialectLabel(): string {
     const cur = app.devices.find((d) => d.kind !== 'Host')?.dialect ?? 'Vrp';
-    return cur === 'Ios' ? '思科 IOS' : cur === 'Comware' ? '华三 Comware' : '华为 VRP';
+    return cur === 'Ios'
+      ? '思科 IOS'
+      : cur === 'Comware'
+        ? '华三 Comware'
+        : cur === 'Tmos'
+          ? 'F5 TMOS 17.x'
+          : '华为 VRP';
   }
 
   function startLab(lab: LabDef) {
@@ -310,7 +327,8 @@
 
   // ---------- 拓扑导入 / 分享 ----------
   let fileInput = $state<HTMLInputElement | null>(null);
-  let topoMsg = $state('');
+  // 启动恢复阶段的旧档映射提示在这里落地，不用静默行为替代提示。
+  let topoMsg = $state(takeLoadNotices().join(' · '));
 
   async function copyShare() {
     try {
@@ -334,7 +352,7 @@
     if (!file) return;
     try {
       const ws = await importFile(file);
-      getSim().load(JSON.stringify(ws.net));
+      const report = loadWithReport(getSim(), ws.net);
       resetPositions();
       for (const [id, pos] of Object.entries(ws.editor.positions ?? {})) {
         setPosition(Number(id), pos);
@@ -343,7 +361,7 @@
       const s = dumpSummary(getSim());
       refreshFrom(s.devices, s.links);
       markDirty();
-      topoMsg = t('left.importOk');
+      topoMsg = [t('left.importOk'), ...report.notices].join(' · ');
     } catch (e) {
       topoMsg = `${t('left.importFail')}: ${String(e)}`;
     }
@@ -368,6 +386,7 @@
           <option value="Ios">{t('course.ios')}</option>
           <option value="Vrp">{t('course.vrp')}</option>
           <option value="Comware">{t('course.comware')}</option>
+          <option value="Tmos">{t('course.tmos')}</option>
         </select>
       {/if}
       <button class="primary" onclick={addDevice}>{t('left.add')}</button>
@@ -390,6 +409,7 @@
               <option value="Ios">{t('course.ios')}</option>
               <option value="Vrp">{t('course.vrp')}</option>
               <option value="Comware">{t('course.comware')}</option>
+              <option value="Tmos">{t('course.tmos')}</option>
             </select>
           </div>
           <div class="ports mono">
@@ -468,26 +488,55 @@
             <li>{task}</li>
           {/each}
         </ol>
-        <button
-          class="primary"
-          onclick={() => {
-            const r = runLabChecks(activeLab!);
-            setLabChecks(r);
-            markLabPassed(activeLab!.id, r.every((x) => x.passed));
-          }}
-        >
-          {t('left.checkBtn')}
-        </button>
+        <div class="behavior-box">
+          <div class="hint">{t('left.behavior.readOnly')}</div>
+          <div class="hint">{t('left.behavior.activeIntro')}</div>
+          <div class="behavior-tags">
+            {#each labActiveBehaviors(activeLab) as b (b)}
+              <span class="behavior-tag">{t(`left.behavior.${b}`)}</span>
+            {/each}
+          </div>
+          {#if labHasActiveChecks(activeLab)}
+            <div class="hint">{t('left.behavior.activeOnlyCompletes')}</div>
+          {/if}
+        </div>
+        <div class="check-row">
+          <button
+            class="primary"
+            disabled={!labHasReadOnlyChecks(activeLab)}
+            onclick={() => {
+              // 纯读路径：只执行纯读项，不推进时间、不探测；含主动项时不标记实验完成。
+              setLabChecks(runLabChecks(activeLab!, 'readOnly'));
+            }}
+          >
+            {t('left.checkReadOnlyBtn')}
+          </button>
+          <button
+            class="primary"
+            onclick={() => {
+              const r = runLabChecks(activeLab!, 'activeExperiment');
+              setLabChecks(r);
+              // 完成只基于一次完整主动判分的真实结果（skipped 不算通过）。
+              markLabPassed(activeLab!.id, r.every((x) => x.passed && !x.skipped));
+            }}
+          >
+            {t('left.checkActiveBtn')}
+          </button>
+        </div>
         {#if app.labChecks}
           <div class="check mono">
             {#each app.labChecks as r}
-              <div class={r.passed ? 'good' : 'bad'}>
-                {r.passed ? '✓' : '✗'} {r.label}
+              <div class={r.skipped ? 'skip' : r.passed ? 'good' : 'bad'}>
+                {r.skipped ? '—' : r.passed ? '✓' : '✗'} {r.label}
+                <span class="src"
+                  >{r.behavior === 'readOnly' ? t('left.src.readOnly') : t('left.src.active')}</span
+                >
                 <span class="detail">{r.detail}</span>
               </div>
             {/each}
           </div>
         {/if}
+        <div class="hint">{t('left.checkModeHint')}</div>
         <button onclick={rotateDialect}>🌐 {t('left.rotateDialect')}（{dialectLabel()}）</button>
         <button onclick={() => startLab(activeLab!)}>{t('left.resetLab')}</button>
         <button class="danger" onclick={exitLab}>{t('left.exitLab')}</button>
@@ -539,6 +588,7 @@
       <div class="row">
         <button class="primary" onclick={copyShare}>{t('left.share')}</button>
       </div>
+      <div class="hint">{LOAD_RESET_NOTICE}</div>
       <input
         class="hidden-file"
         type="file"
@@ -613,11 +663,51 @@
     padding: 0 4px;
     border-radius: 3px;
   }
+  .behavior-box {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px;
+  }
+  .behavior-tags {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+  }
+  .behavior-tag {
+    font-size: 11px;
+    border: 1px solid var(--accent);
+    color: var(--accent);
+    border-radius: 4px;
+    padding: 1px 5px;
+  }
+  .check-row {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+  .check-row button {
+    flex: 1;
+    min-width: 110px;
+  }
   .check {
     font-size: 12px;
     display: flex;
     flex-direction: column;
     gap: 4px;
+  }
+  .check .src {
+    margin-left: 4px;
+    font-size: 10px;
+    border: 1px solid var(--border-strong);
+    border-radius: 3px;
+    padding: 0 3px;
+    color: var(--text-dim);
+  }
+  .skip {
+    color: var(--text-dim);
   }
   .check .detail {
     color: var(--text-dim);

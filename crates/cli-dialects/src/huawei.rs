@@ -1,6 +1,10 @@
-//! 华为 VRP / 新华三 Comware 命令树（两方言结构高度相似，共用构建）。
+//! 华为 VRP 独立命令树（阶段 4A 与 `comware::build()` 拆分）。
 //!
-//! 差异（接口名规则、show 输出、报错前缀、VLAN 命令词）分别在 ifname/show/lib 中按方言处理。
+//! 本文件只定义 VRP 语法；Comware 专属字面量（`Vlan-interface` /
+//! `port access vlan` / `permit` / `Bridge-Aggregation` / `line vty` /
+//! `security-zone name` 等）在 `comware.rs`，不得混用。
+//! 两棵树共享 `crate::cmd` handler、参数工具、`specs` 规格机制与 `sim-core` 状态；
+//! 接口名、提示符、报错与 show 输出按方言在 `ifname` / `show` / `lib` 中处理。
 
 use cli_engine::{CNode, CliError, CmdFn, Ctx, Mode, ParamKind};
 
@@ -13,6 +17,22 @@ fn h_system_view(c: &mut Ctx) -> Result<String, CliError> {
 }
 
 fn h_quit(c: &mut Ctx) -> Result<String, CliError> {
+    // Stage 2B / H6：区域视图 quit 退回进程视图（保留进程号），
+    // 进程视图 quit 才退回系统视图；IOS 的 h_exit 不受影响。
+    if c.sess.mode == Mode::OspfArea {
+        c.sess.mode = Mode::Ospf;
+        if let Some((pid, _)) = c.sess.sub.ospf {
+            c.sess.sub.ospf = Some((pid, 0));
+        }
+        return Ok(String::new());
+    }
+    // 阶段 6A：安全策略规则视图 quit 只退一级到安全策略视图（V9），
+    // 安全策略视图 quit 才退回系统视图；不再把规则视图直接跳回系统视图。
+    if c.sess.mode == Mode::SecurityRule {
+        c.sess.mode = Mode::SecurityPolicy;
+        c.sess.sub.rule = None;
+        return Ok(String::new());
+    }
     c.sess.mode = match c.sess.mode {
         Mode::If
         | Mode::Pool
@@ -21,15 +41,17 @@ fn h_quit(c: &mut Ctx) -> Result<String, CliError> {
         | Mode::Aaa
         | Mode::Mst
         | Mode::Ospf
-        | Mode::OspfArea
         | Mode::Bgp
         | Mode::Isis
         | Mode::RoutePolicy
         | Mode::Zone
         | Mode::SecurityPolicy
-        | Mode::SecurityRule
         | Mode::Ipsec
-        | Mode::Ospfv3 => Mode::Config,
+        | Mode::Ospfv3
+        | Mode::Vlan
+        | Mode::ClassMap
+        | Mode::PolicyMap
+        | Mode::PolicyMapClass => Mode::Config,
         _ => Mode::Exec,
     };
     if c.sess.mode != Mode::If {
@@ -85,15 +107,68 @@ fn undo_branch() -> CNode {
         .kid(CNode::lit("shutdown", "Undo the shutdown state").run(h_undo_shutdown))
         .kid(
             CNode::lit("ip", "IP information")
-                .kid(CNode::lit("address", "Remove the IP address").run(cmd::no_ip_address)),
+                .kid(CNode::lit("address", "Remove the IP address").run(cmd::no_ip_address))
+                .kid(
+                    CNode::lit("route-static", "Delete a static route")
+                        .run(cmd::no_static_route)
+                        .kid(
+                            CNode::param(ParamKind::Ipv4, "dst", "Destination prefix").kid(
+                                CNode::param(ParamKind::PrefixLen, "mask", "Prefix length").kid(
+                                    CNode::param(ParamKind::Ipv4, "nexthop", "Next-hop IP address"),
+                                ),
+                            ),
+                        ),
+                ),
         )
         .kid(CNode::lit("eth-trunk", "Leave the Eth-Trunk").run(cmd::lag_unbind))
+        // Stage 2B / H2：恢复默认 STP 优先级并重新选举根桥。
         .kid(
-            CNode::lit("port", "Port commands").kid(
-                CNode::lit("link-aggregation", "Link aggregation")
-                    .kid(CNode::lit("group", "Leave the aggregation group").run(cmd::lag_unbind)),
+            CNode::lit("stp", "STP negation")
+                .kid(
+                    CNode::lit("priority", "Restore the default STP priority")
+                        .run(cmd::stp_no_priority),
+                )
+                .kid(CNode::lit("root", "Undo the root bridge role").run(cmd::stp_no_priority)),
+        )
+        // Stage 2B / H6：撤销 OSPF 进程 / network，配置与协议状态同步。
+        .kid(CNode::lit("ospf", "Remove the OSPF process").kid(
+            CNode::param(ParamKind::Number, "process", "OSPF process id").run(cmd::ospf_no_process),
+        ))
+        .kid(
+            CNode::lit("network", "Remove an OSPF network statement").kid(
+                CNode::param(ParamKind::Ipv4, "net", "Network address").kid(
+                    CNode::param(ParamKind::Wildcard, "wildcard", "Wildcard bits")
+                        .run(cmd::ospf_no_network),
+                ),
             ),
         )
+        // Stage 2C / H4：撤销 BGP 进程，配置/会话/路由同步。
+        .kid(CNode::lit("bgp", "Remove the BGP process").kid(
+            CNode::param(ParamKind::Number, "asn", "Local AS number").run(cmd::bgp_no_process),
+        ))
+        // Stage 2C / H5：撤销整条 route-policy 或单个节点。
+        .kid(
+            CNode::lit("route-policy", "Remove a route policy").kid(
+                CNode::param(ParamKind::Word, "name", "Route policy name")
+                    .run(cmd::route_policy_no)
+                    .kid(
+                        CNode::lit("node", "Route policy node").kid(
+                            CNode::param(ParamKind::Number, "seq", "Node sequence")
+                                .run(cmd::route_policy_no),
+                        ),
+                    ),
+            ),
+        )
+        // Stage 2C / H5：撤销整条 ACL（复用 C5 语义，解除接口绑定并重算策略）。
+        .kid(
+            CNode::lit("acl", "Remove an ACL")
+                .kid(CNode::param(ParamKind::Number, "number", "ACL number").run(cmd::acl_no_all)),
+        )
+        .kid(CNode::lit("port", "Port commands").kid(
+            CNode::lit("default", "Reset the default VLAN").kid(
+                CNode::lit("vlan", "Restore the default VLAN (VLAN 1)").run(cmd::no_access_vlan),
+            ),
+        ))
 }
 
 fn display_branch() -> CNode {
@@ -168,10 +243,20 @@ fn display_branch() -> CNode {
             CNode::lit("route-policy", "Display route policy information")
                 .run(cmd::show_route_policy),
         )
+        // 阶段 6A：VRP 只承诺 `display security-policy`（含 rule name 明细，V9）；
+        // Comware 的 `display security-zone` 属其独立树，不再混入 VRP。
         .kid(
-            CNode::lit("security-policy", "Display security policy").run(cmd::show_security_policy),
+            CNode::lit("security-policy", "Display security policy")
+                .run(cmd::show_security_policy)
+                .kid(
+                    CNode::lit("rule", "Display a security policy rule").kid(
+                        CNode::lit("name", "Rule name").kid(
+                            CNode::param(ParamKind::Word, "name", "Rule name")
+                                .run(cmd::show_security_policy_rule),
+                        ),
+                    ),
+                ),
         )
-        .kid(CNode::lit("security-zone", "Display security zones").run(cmd::show_security_zone))
         .kid(
             CNode::lit("ipsec", "Display IPsec information")
                 .kid(CNode::lit("tunnel", "Display static tunnels").run(cmd::show_ipsec)),
@@ -185,10 +270,16 @@ fn display_branch() -> CNode {
         .kid(CNode::lit("evpn", "Display EVPN information").run(cmd::show_evpn))
         .kid(CNode::lit("stack", "Display stack information").run(cmd::show_stack))
         .kid(CNode::lit("mlag", "Display M-LAG information").run(cmd::show_mlag))
-        .kid(CNode::lit("ltm", "Display LTM information").run(cmd::show_ltm))
         .kid(
             CNode::lit("firewall", "Display firewall information")
-                .kid(CNode::lit("zone", "Display security zones").run(cmd::show_security_zone)),
+                .kid(CNode::lit("zone", "Display security zones").run(cmd::show_security_zone))
+                // 阶段 6A 基线：`display firewall session table`（V3/V9）。
+                .kid(
+                    CNode::lit("session", "Display session table information").kid(
+                        CNode::lit("table", "Display the session table")
+                            .run(cmd::show_security_session),
+                    ),
+                ),
         )
         .kid(CNode::lit("vlan", "Display VLAN information").run(cmd::show_vlan))
         .kid(CNode::lit("mac-address", "Display the MAC address table").run(cmd::show_mac))
@@ -215,22 +306,13 @@ fn display_branch() -> CNode {
                         .run(cmd::show_lag),
                 ),
         )
-        .kid(
-            CNode::lit("link-aggregation", "Display link aggregation information")
-                .run(cmd::show_lag)
-                .kid(CNode::lit("summary", "Summary of aggregation groups").run(cmd::show_lag))
-                .kid(CNode::lit("verbose", "Detailed aggregation information").run(cmd::show_lag)),
-        )
 }
 
-/// 本地用户配置（VRP / Comware 两种子树共用）。
+/// 本地用户配置（VRP：`password irreversible-cipher` / `privilege level`）。
+/// Comware 的 `class manage` / `password simple` / `user-role` 在 `comware.rs`。
 fn local_user_node() -> CNode {
     CNode::lit("local-user", "Configure a local user").kid(
         CNode::param(ParamKind::Word, "name", "User name")
-            .kid(
-                CNode::lit("class", "User class (Comware)")
-                    .kid(CNode::lit("manage", "Manage class").run(cmd::mgmt_local_user_enter)),
-            )
             .kid(
                 CNode::lit("password", "Set the user password")
                     .kid(
@@ -240,13 +322,7 @@ fn local_user_node() -> CNode {
                         ),
                     )
                     .kid(
-                        CNode::lit("simple", "Plain text (Comware)").kid(
-                            CNode::param(ParamKind::Word, "secret", "Password")
-                                .run(cmd::mgmt_user_password),
-                        ),
-                    )
-                    .kid(
-                        CNode::lit("irreversible-cipher", "Irreversible cipher (VRP)").kid(
+                        CNode::lit("irreversible-cipher", "Irreversible cipher").kid(
                             CNode::param(ParamKind::Word, "secret", "Password")
                                 .run(cmd::mgmt_user_password),
                         ),
@@ -264,18 +340,6 @@ fn local_user_node() -> CNode {
                 CNode::lit("service-type", "Allowed service types").kid(
                     CNode::param(ParamKind::WordList, "services", "telnet | ssh | all")
                         .run(cmd::mgmt_user_service),
-                ),
-            )
-            .kid(
-                CNode::lit(
-                    "authorization-attribute",
-                    "Authorization attributes (Comware)",
-                )
-                .kid(
-                    CNode::lit("user-role", "User role").kid(
-                        CNode::param(ParamKind::Word, "role", "network-admin | network-operator")
-                            .run(cmd::mgmt_user_role),
-                    ),
                 ),
             ),
     )
@@ -411,6 +475,12 @@ pub fn build() -> Trees {
             ping(),
             display_branch(),
             CNode::lit("save", "Save the current configuration").run(cmd::save_msg),
+            // 阶段 6A 基线：清除会话表（V3）。用户视图可执行。
+            CNode::lit("reset", "Reset operation").kid(CNode::lit("firewall", "Firewall").kid(
+                CNode::lit("session", "Session").kid(
+                    CNode::lit("table", "Clear the session table").run(cmd::reset_security_session),
+                ),
+            )),
         ]
         .into_iter()
         .chain(login_cmds())
@@ -453,9 +523,7 @@ pub fn build() -> Trees {
                         .run(cmd::security_zone_enter),
                 ),
             ),
-            CNode::lit("security-zone", "Security zone").kid(CNode::lit("name", "Zone name").kid(
-                CNode::param(ParamKind::Word, "zone", "Zone name").run(cmd::security_zone_enter),
-            )),
+            // Comware 的 security-zone name 不进入 VRP 树（阶段 4A 双向隔离）。
             CNode::lit("ipsec", "IPsec configuration").kid(
                 CNode::lit("tunnel", "Static site-to-site tunnel").kid(
                     CNode::param(ParamKind::Word, "name", "Tunnel name").kid(
@@ -534,35 +602,7 @@ pub fn build() -> Trees {
                     CNode::lit("peer", "EVPN peer")
                         .kid(CNode::param(ParamKind::Ipv4, "ip", "Peer VTEP").run(cmd::evpn_peer)),
                 ),
-            CNode::lit("ltm", "Local Traffic Manager")
-                .kid(
-                    CNode::lit("pool", "Server pool").kid(
-                        CNode::param(ParamKind::Word, "pool", "Pool name").kid(
-                            CNode::lit("member", "Pool member").kid(
-                                CNode::param(ParamKind::Ipv4, "ip", "Member IP").kid(
-                                    CNode::param(ParamKind::Number, "port", "Service port")
-                                        .run(cmd::ltm_pool_member),
-                                ),
-                            ),
-                        ),
-                    ),
-                )
-                .kid(
-                    CNode::lit("virtual", "Virtual server").kid(
-                        CNode::param(ParamKind::Word, "name", "Virtual name").kid(
-                            CNode::lit("vip", "Virtual IP").kid(
-                                CNode::param(ParamKind::Ipv4, "vip", "VIP address").kid(
-                                    CNode::param(ParamKind::Number, "port", "Service port").kid(
-                                        CNode::lit("pool", "Pool name").kid(
-                                            CNode::param(ParamKind::Word, "pool", "Pool name")
-                                                .run(cmd::ltm_virtual),
-                                        ),
-                                    ),
-                                ),
-                            ),
-                        ),
-                    ),
-                ),
+            // 阶段 5A：抽象 `ltm` 命令已移除；LTM 只属于独立 Dialect::Tmos / tmsh。
             CNode::lit("stack", "Stack/IRF configuration")
                 .kid(CNode::lit("domain", "Stack domain").kid(
                     CNode::param(ParamKind::Number, "domain", "Domain ID").run(cmd::stack_domain),
@@ -609,14 +649,7 @@ pub fn build() -> Trees {
                     ),
                 ),
             ),
-            CNode::lit("line", "Configure terminal lines (Comware)").kid(
-                CNode::lit("vty", "Virtual terminal lines").kid(
-                    CNode::param(ParamKind::Number, "first", "First line number").kid(
-                        CNode::param(ParamKind::Number, "last", "Last line number")
-                            .run(cmd::mgmt_enter_line),
-                    ),
-                ),
-            ),
+            // Comware 的 line vty 不进入 VRP 树（阶段 4A 双向隔离）。
             CNode::lit("vlan", "VLAN commands")
                 .run(cmd::create_vlans)
                 .kid(CNode::param(ParamKind::Number, "vlan", "VLAN ID, 1-4094"))
@@ -746,6 +779,12 @@ pub fn build() -> Trees {
                     ),
                 )
                 .kid(
+                    CNode::lit("root", "Configure this switch as a root bridge").kid(
+                        CNode::param(ParamKind::Word, "which", "primary | secondary")
+                            .run(cmd::stp_root),
+                    ),
+                )
+                .kid(
                     CNode::lit("disable", "Disable the spanning tree protocol")
                         .run(|c| cmd::stp_enable(c, false)),
                 ),
@@ -763,24 +802,8 @@ pub fn build() -> Trees {
                     ),
                 )
                 .kid(
-                    CNode::lit("vlan-interface", "VLAN interface (SVI, Comware)").kid(
-                        CNode::param(ParamKind::Number, "vlan", "VLAN ID, 1-4094")
-                            .run(cmd::interface_svi),
-                    ),
-                )
-                .kid(
-                    CNode::lit("eth-trunk", "Eth-Trunk interface (VRP)").kid(
+                    CNode::lit("eth-trunk", "Eth-Trunk interface").kid(
                         CNode::param(ParamKind::Number, "lag", "Eth-Trunk ID, 1-128")
-                            .run(cmd::interface_lag),
-                    ),
-                )
-                .kid(
-                    CNode::lit(
-                        "bridge-aggregation",
-                        "Bridge-Aggregation interface (Comware)",
-                    )
-                    .kid(
-                        CNode::param(ParamKind::Number, "lag", "Aggregation ID, 1-128")
                             .run(cmd::interface_lag),
                     ),
                 ),
@@ -825,7 +848,7 @@ pub fn build() -> Trees {
                         )
                         .kid(
                             CNode::lit("trunk", "Trunk port (tagged, multiple VLANs)")
-                                .run(cmd::lt_trunk),
+                                .run(cmd::enter_trunk),
                         ),
                 )
                 .kid(
@@ -837,51 +860,16 @@ pub fn build() -> Trees {
                     ),
                 )
                 .kid(
-                    CNode::lit("access", "Assign the access VLAN (Comware)").kid(
-                        CNode::lit("vlan", "Set the access VLAN").kid(
-                            CNode::param(ParamKind::Number, "vlan", "VLAN ID, 1-4094")
-                                .run(cmd::access_vlan),
-                        ),
-                    ),
-                )
-                .kid(
-                    CNode::lit("trunk", "Trunk port characteristics")
-                        .kid(
-                            CNode::lit("allow-pass", "Allow specified VLANs on the trunk (VRP)")
-                                .kid(
-                                    CNode::lit("vlan", "VLAN list to allow").kid(
-                                        CNode::param(
-                                            ParamKind::VlanList,
-                                            "vlans",
-                                            "VLAN list, e.g. 10 20",
-                                        )
-                                        .run(cmd::trunk_allow),
-                                    ),
-                                ),
-                        )
-                        .kid(
-                            CNode::lit("permit", "Permit specified VLANs on the trunk (Comware)")
-                                .kid(
-                                    CNode::lit("vlan", "VLAN list to permit").kid(
-                                        CNode::param(
-                                            ParamKind::VlanList,
-                                            "vlans",
-                                            "VLAN list, e.g. 10 20",
-                                        )
-                                        .run(cmd::trunk_allow),
-                                    ),
-                                ),
-                        ),
-                )
-                .kid(
-                    CNode::lit("link-aggregation", "Link aggregation (Comware)").kid(
-                        CNode::lit("group", "Join an aggregation group").kid(
-                            CNode::param(ParamKind::Number, "group", "Aggregation group, 1-128")
-                                .run(cmd::lag_bind_dynamic),
+                    CNode::lit("trunk", "Trunk port characteristics").kid(
+                        CNode::lit("allow-pass", "Allow specified VLANs on the trunk").kid(
+                            CNode::lit("vlan", "VLAN list to allow").kid(
+                                CNode::param(ParamKind::VlanList, "vlans", "VLAN list, e.g. 10 20")
+                                    .run(cmd::trunk_allow),
+                            ),
                         ),
                     ),
                 ),
-            CNode::lit("eth-trunk", "Join an Eth-Trunk (VRP)").kid(
+            CNode::lit("eth-trunk", "Join an Eth-Trunk").kid(
                 CNode::param(ParamKind::Number, "group", "Eth-Trunk ID, 1-128")
                     .run(cmd::lag_bind_dynamic),
             ),
@@ -896,11 +884,7 @@ pub fn build() -> Trees {
                             .run(cmd::lag_mode_static),
                     ),
                 ),
-            CNode::lit("link-aggregation", "Link aggregation (Comware)").kid(
-                CNode::lit("mode", "Aggregation working mode")
-                    .kid(CNode::lit("dynamic", "LACP dynamic mode").run(cmd::lag_mode_lacp))
-                    .kid(CNode::lit("static", "Static aggregation mode").run(cmd::lag_mode_static)),
-            ),
+            // Comware 的 link-aggregation mode 不进入 VRP 树。
             CNode::lit("ipv6", "IPv6 interface configuration").kid(
                 CNode::lit("address", "Set the IPv6 address").kid(
                     CNode::param(
@@ -1120,6 +1104,21 @@ pub fn build() -> Trees {
                 CNode::param(ParamKind::Word, "area", "Area ID, e.g. 0 or 0.0.0.0")
                     .run(cmd::ospf_area_enter),
             ),
+            CNode::lit("undo", "Negate an OSPF setting")
+                .kid(
+                    CNode::lit("area", "Remove an OSPF area").kid(
+                        CNode::param(ParamKind::Word, "area", "Area ID").run(cmd::ospf_no_area),
+                    ),
+                )
+                .kid(
+                    CNode::lit("network", "Remove an OSPF network statement").kid(
+                        CNode::param(ParamKind::Ipv4, "net", "Network address").kid(
+                            CNode::param(ParamKind::Wildcard, "wildcard", "Wildcard bits")
+                                .run(cmd::ospf_no_network),
+                        ),
+                    ),
+                ),
+            display_branch(),
             CNode::lit("quit", "Quit from the current view").run(h_quit),
             CNode::lit("return", "Return to the user view").run(h_return),
         ],
@@ -1129,6 +1128,20 @@ pub fn build() -> Trees {
             CNode::lit("quit", "Quit from the current view").run(h_quit),
             CNode::lit("return", "Return to the user view").run(h_return),
         ],
+        // VRP 的 `vlan <id>` 在阶段 4A 仍是迁移期共享语法，不切换视图；
+        // 这里只提供 VLAN 视图的最小退出集合，避免会话滞留，不承诺 VRP 保真。
+        vlan: vec![
+            display_branch(),
+            CNode::lit("quit", "Quit from the current view").run(h_quit),
+            CNode::lit("return", "Return to the user view").run(h_return),
+        ],
+        // 阶段 5A：tmsh 模块只属于独立 Tmos 树，VRP 树不承载任何 tmsh 节点。
+        tmos_ltm: vec![],
+        tmos_sys: vec![],
+        // 阶段 6B：ZBF 子模式只存在于 IOS XE 树。
+        class_map: vec![],
+        policy_map: vec![],
+        policy_map_class: vec![],
         ospf_area: vec![
             CNode::lit("network", "Enable OSPF on a network").kid(
                 CNode::param(ParamKind::Ipv4, "net", "Network address").kid(
@@ -1136,6 +1149,15 @@ pub fn build() -> Trees {
                         .run(cmd::ospf_network),
                 ),
             ),
+            CNode::lit("undo", "Negate an area setting").kid(
+                CNode::lit("network", "Remove an OSPF network statement").kid(
+                    CNode::param(ParamKind::Ipv4, "net", "Network address").kid(
+                        CNode::param(ParamKind::Wildcard, "wildcard", "Wildcard bits")
+                            .run(cmd::ospf_no_network),
+                    ),
+                ),
+            ),
+            display_branch(),
             CNode::lit("quit", "Quit from the current view").run(h_quit),
             CNode::lit("return", "Return to the user view").run(h_return),
         ],
@@ -1167,6 +1189,37 @@ pub fn build() -> Trees {
                             .run(cmd::bgp_network),
                     ),
             ),
+            CNode::lit("undo", "Negate a BGP setting")
+                .kid(
+                    CNode::lit("peer", "Remove a BGP peer or its policy").kid(
+                        CNode::param(ParamKind::Ipv4, "ip", "Peer IP address")
+                            .run(cmd::bgp_no_neighbor)
+                            .kid(
+                                CNode::lit("route-policy", "Remove a peer route policy").kid(
+                                    CNode::param(ParamKind::Word, "policy", "Route policy name")
+                                        .kid(
+                                            CNode::param(ParamKind::Word, "dir", "import | export")
+                                                .run(cmd::bgp_no_peer_policy),
+                                        ),
+                                ),
+                            ),
+                    ),
+                )
+                .kid(
+                    CNode::lit("network", "Withdraw an advertised network").kid(
+                        CNode::param(ParamKind::Ipv4, "net", "Network address")
+                            .kid(
+                                CNode::lit("mask", "Subnet mask").kid(
+                                    CNode::param(ParamKind::DottedMask, "mask", "Subnet mask")
+                                        .run(cmd::bgp_no_network),
+                                ),
+                            )
+                            .kid(
+                                CNode::param(ParamKind::DottedMask, "mask", "Subnet mask")
+                                    .run(cmd::bgp_no_network),
+                            ),
+                    ),
+                ),
             CNode::lit("quit", "Quit from the current view").run(h_quit),
             CNode::lit("return", "Return to the user view").run(h_return),
         ],
@@ -1191,6 +1244,23 @@ pub fn build() -> Trees {
                         .run(cmd::route_policy_set_local_pref),
                 ),
             ),
+            CNode::lit("undo", "Negate a route policy setting")
+                .kid(
+                    CNode::lit("if-match", "Remove a match criterion")
+                        .run(cmd::route_policy_no_match)
+                        .kid(
+                            CNode::lit("acl", "Remove the ACL match")
+                                .run(cmd::route_policy_no_match),
+                        ),
+                )
+                .kid(
+                    CNode::lit("apply", "Remove applied attributes")
+                        .run(cmd::route_policy_no_apply)
+                        .kid(
+                            CNode::lit("local-preference", "Remove local preference")
+                                .run(cmd::route_policy_no_apply),
+                        ),
+                ),
             CNode::lit("quit", "Quit from the current view").run(h_quit),
             CNode::lit("return", "Return to the user view").run(h_return),
         ],
@@ -1201,19 +1271,47 @@ pub fn build() -> Trees {
                         .run(cmd::security_zone_add_if),
                 ),
             ),
-            CNode::lit("import", "Import an interface into the zone").kid(
-                CNode::lit("interface", "Interface").kid(
-                    CNode::param(ParamKind::IfName, "if", "e.g. GigabitEthernet1/0/1")
-                        .run(cmd::security_zone_add_if),
+            // 阶段 6A 基线：`undo add interface <if>` 把接口移出区域（V5）。
+            CNode::lit("undo", "Negate a zone setting").kid(
+                CNode::lit("add", "Remove an interface from the zone").kid(
+                    CNode::lit("interface", "Interface").kid(
+                        CNode::param(ParamKind::IfName, "if", "e.g. GigabitEthernet0/0/0")
+                            .run(cmd::security_zone_no_add_if),
+                    ),
                 ),
             ),
+            // Comware 的 import interface 不进入 VRP 树。
             CNode::lit("quit", "Quit from the current view").run(h_quit),
             CNode::lit("return", "Return to the user view").run(h_return),
         ],
         security_policy: vec![
-            CNode::lit("rule", "Security policy rule").kid(CNode::lit("name", "Rule name").kid(
-                CNode::param(ParamKind::Word, "name", "Rule name").run(cmd::security_rule_enter),
-            )),
+            CNode::lit("rule", "Security policy rule")
+                .kid(
+                    CNode::lit("name", "Rule name").kid(
+                        CNode::param(ParamKind::Word, "name", "Rule name")
+                            .run(cmd::security_rule_enter),
+                    ),
+                )
+                // 阶段 6A 基线：`rule move <name1> { before | after } <name2>`（V7）。
+                .kid(
+                    CNode::lit("move", "Move a security policy rule").kid(
+                        CNode::param(ParamKind::Word, "from", "Rule to move").kid(
+                            CNode::param(ParamKind::Word, "pos", "before | after").kid(
+                                CNode::param(ParamKind::Word, "to", "Reference rule")
+                                    .run(cmd::security_rule_move),
+                            ),
+                        ),
+                    ),
+                ),
+            // 阶段 6A 基线：`undo rule name <name>` 删除规则。
+            CNode::lit("undo", "Negate a security policy setting").kid(
+                CNode::lit("rule", "Security policy rule").kid(
+                    CNode::lit("name", "Rule name").kid(
+                        CNode::param(ParamKind::Word, "name", "Rule name")
+                            .run(cmd::security_rule_delete),
+                    ),
+                ),
+            ),
             CNode::lit("quit", "Quit from the current view").run(h_quit),
             CNode::lit("return", "Return to the user view").run(h_return),
         ],
@@ -1229,6 +1327,24 @@ pub fn build() -> Trees {
             CNode::lit("action", "Policy action").kid(
                 CNode::param(ParamKind::Word, "action", "permit | deny").run(cmd::security_action),
             ),
+            // 阶段 6A 基线：规则视图 enable / disable（V7，缺省启用）。
+            CNode::lit("enable", "Enable this security policy rule").run(cmd::security_rule_enable),
+            CNode::lit("disable", "Disable this security policy rule")
+                .run(cmd::security_rule_disable),
+            // 否定形式：清空匹配条件。
+            CNode::lit("undo", "Negate a rule condition")
+                .kid(
+                    CNode::lit("source-zone", "Remove the source zone")
+                        .run(cmd::security_rule_no_source),
+                )
+                .kid(
+                    CNode::lit("destination-zone", "Remove the destination zone")
+                        .run(cmd::security_rule_no_destination),
+                )
+                .kid(
+                    CNode::lit("action", "Reset the policy action")
+                        .run(cmd::security_rule_no_action),
+                ),
             CNode::lit("quit", "Quit from the current view").run(h_quit),
             CNode::lit("return", "Return to the user view").run(h_return),
         ],

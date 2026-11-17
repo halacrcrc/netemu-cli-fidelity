@@ -5,6 +5,20 @@ import { app } from './store.svelte';
 
 const KEY = 'netemu.workspace.v1';
 
+/** 与 sim-core::profile::LOAD_RESET_NOTICE 同义，UI 必须明示，不做静默清空。 */
+export const LOAD_RESET_NOTICE = '加载将重置所有终端会话';
+
+/** 启动恢复阶段的加载报告由 main.ts 写入，LeftPanel 首次挂载时取用。 */
+let pendingLoadNotices: string[] = [];
+export function setLoadNotices(notices: string[]) {
+  pendingLoadNotices = notices;
+}
+export function takeLoadNotices(): string[] {
+  const n = pendingLoadNotices;
+  pendingLoadNotices = [];
+  return n;
+}
+
 export interface Workspace {
   net: NetSummary;
   editor: {
