@@ -19,7 +19,7 @@
 | 测试 | **355 passed / 0 failed / 53 个测试二进制**（基线 349 / 52，差值见 §4） |
 | 门禁 | clippy / test / wasm / tsc / vite build 全绿；fmt 逐文件抽查（§4.3） |
 | 浏览器 | 真实 Chrome + 本次构建，Lab 6 全流程 4/4、讲义 08 ZBF 简流程会话 1 条、实验二十二 SRv6 Policy 子视图可进；控制台 0 错误 |
-| 推送 | `origin/main` 已推（**未推 `upstream`**，公开发布仍由用户决策） |
+| 推送 | `git push origin main` **在本机网络上失败**（`Failed to connect to github.com:443`，多次重试一致，见 §8.1）；本地 `main` 已含合并提交，网络可用时执行同一条命令即可（**不推 `upstream`**） |
 
 ---
 
@@ -182,7 +182,19 @@
 - 合并改动：**29 个文件变更**（+1148 / −129），其中新增文件 1 个（`crates/cli-dialects/tests/srv6_policy_golden.rs`），本记录与 2 张截图为后续新增。
 - 合并后 `git status`：无 `UU`/未解决冲突（`git diff --check` 空、冲突标记 grep 空）。
 - 分支历史：`main` 保留两侧提交 + 一个合并提交 `fdcfbe4`（父 `16f10a7` + `58e22e9`；不 rebase、不改写任一侧提交）。
-- 推送：`git push origin main` → 成功（`origin` = 私有仓库 `netemu-cli-fidelity`）。
+- 推送：`git push origin main` → **失败（环境网络问题，非仓库问题）**，详见 §8.1。本地 `main` 已就绪：`origin/main..main` 共 7 个提交（合并提交 + 记录提交 + 对方 5 个提交）。
 - **明确未做**：未推送 `upstream`；未新增功能；未删测、未放宽断言；未改写给定提交。
+
+### 8.1 推送失败的真实记录
+
+| 时间/尝试 | 命令 | 结果 |
+|---|---|---|
+| 第 1 次 | `git push origin main` | `OpenSSL SSL_read: unexpected eof while reading` |
+| 第 2 次 | `git push origin main` | `Recv failure: Connection was reset` |
+| 第 3 次 | `git -c http.version=HTTP/1.1 push origin main` | `Failed to connect to github.com:443 after 21039 ms` |
+| 第 4~6 次（间隔 8s / 10s / 直接重试） | `git push origin main` | 同「connect 超时」，`git ls-remote origin` 亦同样失败 |
+
+归因：`Resolve-DnsName github.com` 解析到 `20.6.7.17`，TCP 443 握手超时；本机无 HTTP(S)_PROXY / WinHTTP 代理，与仓库凭据、远端仓库状态无关。
+网络可用时执行：`git push origin main`（**不要** `git push upstream`）。
 
 > 公开仓库收平（把 `main` rebase/merge 回推到 `upstream`）是用户决策项，不在本包范围内。
