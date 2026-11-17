@@ -17,7 +17,7 @@
 | 冲突 | 9 文件 14 块，全部解决；冲突标记残留 0（`git grep -E '^(<<<<<<<|=======|>>>>>>>)'` 空） |
 | 双方功能存活 | 我方 ZBF / 防火墙接地 / 规格驱动 / 双通道 / 课程原文测试 × 对方 SRv6 Policy / EVPN TTL / ping6 会话泄漏修复 / UI 打磨，全部在 |
 | 测试 | **355 passed / 0 failed / 53 个测试二进制**（基线 349 / 52，差值见 §4） |
-| 门禁 | clippy / test / wasm / tsc / vite build 全绿；fmt 逐文件抽查（§4.3） |
+| 门禁 | 本地 clippy / test / wasm / tsc / vite build 全绿；fmt 差异已由 `4ac608a` 收口（§4.3、§9），CI 全绿（run 44055929810） |
 | 浏览器 | 真实 Chrome + 本次构建，Lab 6 全流程 4/4、讲义 08 ZBF 简流程会话 1 条、实验二十二 SRv6 Policy 子视图可进；控制台 0 错误 |
 | 推送 | `git push origin main` 已成功（`16f10a7..490c0bf`）；直连 443 被阻断，经用户提供的本地代理 `127.0.0.1:10808` 完成，过程见 §8.1（**不推 `upstream`**） |
 
@@ -99,7 +99,9 @@
 
 - `cargo fmt` 处理 `cli-dialects/src/lib.rs` 时会连带格式化子模块 `ios.rs` 并挂起，属既有环境事项；本包改用**逐文件** `rustfmt --check` 替代。
 - 逐文件结果：`cli-engine/src/lib.rs`、`lab-checks/src/lib.rs`、`cli-dialects/{lib,huawei,comware,tmos,config_render}.rs`、`sim-core/{engine,device,summary}.rs`、`sim-packets/src/lib.rs`、`sim-wasm/src/lib.rs`、`tests/srv6_policy_golden.rs` 全部通过。
-- 剩余 2 处差异（`ios.rs:966` 附近 ZBF `class-map` 代码块、`sim-wasm/src/c6b_tests.rs:386` 的 `en_count` 断行）在**合并前就在**：把 `16f10a7` 的同名文件单独 `rustfmt --check`，两处差异位置与内容一致 → 属我方既有未格式化，不是本次合并引入，本包不改写（避免无关行 diff）。
+- 剩余差异（`ios.rs:966` 附近 ZBF `class-map` 代码块、`sim-wasm/src/c6b_tests.rs:386` 的 `en_count` 断行）在**合并前就在**：把 `16f10a7` 的同名文件单独 `rustfmt --check`，差异位置与内容一致 → 属我方既有未格式化，不是本次合并引入。
+- 当时判为"不改写以避免无关行 diff"，**事后证明是错的**：这批差异在 CI 里表现为 `格式检查` 一步失败，后续 Clippy/测试/WASM/前端构建全部 skipped（run 44007744327，且合并前 `16f10a7` 的 CI 同样红）。
+- 已单独收口（2026-11-17，见 §9）：CI 实测共 **26 处 / 5 文件**（`ios.rs` 4、`lib.rs` 8、`tests/c6b_courses.rs` 4、`tests/c6b_mgmt_grounding.rs` 8、`sim-wasm/src/c6b_tests.rs` 2），由一次性工作流在 CI 同版本 rustfmt 下 `cargo fmt --all` 修掉，commit `4ac608a`。
 - 新增代码（§2 合写块、`Srv6Policy` 臂、`Trees` 字段）已随上述逐文件检查确认为 fmt 合规。
 
 ---
@@ -200,4 +202,41 @@
 代理只以**单命令 `-c` 参数**传入，未写入 `.gitconfig`、未改动任何 git 配置。
 后续若需再次推送且直连仍不通：`git -c http.proxy=http://127.0.0.1:10808 push origin main`（**不要** `git push upstream`）。
 
-> 公开仓库收平（把 `main` rebase/merge 回推到 `upstream`）是用户决策项，不在本包范围内。
+---
+
+## 9. 合并后收口：CI 变红与部署拓扑调整（2026-11-17）
+
+### 9.1 CI 为什么红（两个独立问题，都不是本次合并引入）
+
+| 现象 | 证据 | 归因 |
+|---|---|---|
+| `CI` 卡在 `格式检查`，后续 Clippy/测试/WASM/前端构建全部 skipped | run `44007744327`（`bd6e71c`）；合并前 `16f10a7` 的 run `43998695817` 同样卡在此步 | 我方既有未格式化代码，§4.3 已登记但当时未修 |
+| `Deploy to GitHub Pages` 的 `deploy` job 404 | `Failed to create deployment (status: 404) … Ensure GitHub Pages has been enabled`；合并前 run `43998695895` 同样 404 | 私有仓库 `netemu-cli-fidelity` 从未启用 Pages（`GET /repos/{r}/pages` → 404）；上游公开仓库的 Pages 一直正常，`gh run list` 默认指向它，所以"部署成功"的记录其实来自另一个仓库 |
+
+### 9.2 fmt 收口（26 处 / 5 文件）
+
+本机 `rustfmt 1.10.0-stable` 对 `cli-dialects/src/ios.rs`、`lib.rs` 会**挂死**（45 秒超时后 kill；纯 ASCII 路径 `E:\fmtwork` 复现，非路径编码问题；同一 rustfmt 对 `tiny.rs` 与其余 3 个测试文件正常），无法本地产生与 CI 一致的结果。
+处置：临时加 `workflow_dispatch` 工作流 `.github/workflows/fmt-fix.yml`，在 CI 同版本 rustfmt 下 `cargo fmt --all` 并提交 → `4ac608a`（5 文件 +113/−76，逐条抽查为纯换行/折行）→ 删工作流 `1360686`。
+
+格式化后本地复跑（`CARGO_TARGET_DIR=E:\netemu-target-inline`）：clippy **0 warning**；**355 passed / 0 failed / 53 二进制**（与格式化前一致，确认无语义影响）。
+
+### 9.3 部署拓扑调整（用户决策：旧仓下线、新仓上台）
+
+| 仓库 | 调整前 | 调整后 | 实际执行 |
+|---|---|---|---|
+| `halacrcrc/netemu` | public，Pages 启用（`https://halacrcrc.github.io/netemu/`） | **private**，Pages 删除，`Deploy to GitHub Pages` 工作流 `disabled_manually`（CI 保留） | `gh workflow disable` → `DELETE /repos/{r}/pages` → `PATCH private=true` |
+| `halacrcrc/netemu-cli-fidelity` | private，Pages 未启用 | **public**，Pages 启用（`build_type: workflow`，`https://halacrcrc.github.io/netemu-cli-fidelity/`） | `PATCH private=false` → `POST /repos/{r}/pages -F build_type=workflow` |
+
+转公开前做过敏感信息扫描：tracked 文件中无 `ghp_`/`gho_`/`AKIA`/`sk-`/私钥块命中；历史里 `ghp_` 仅出现在笔记页的占位文案 `ghp_…（经典 PAT，gist 权限）`，非真实令牌；无 `.env`/证书类文件入库。
+
+### 9.4 收口后的真实结果
+
+| 项 | 结果 |
+|---|---|
+| CI（`1360686`，run `44055929810`） | ✅ 格式检查 → Clippy → 单元与场景测试 → 构建 WASM → 前端构建 全通过 |
+| Pages 部署（run `44055929829`） | ✅ `build` 1m21s、`deploy` 10s 均成功 |
+| 线上站点 | `curl` → **200**，`<title>网工模拟器 · 网络工程师学习练习场</title>`；资源 `index-D11s63pn.js` / `index-DsnzkBrK.css` 200 |
+| 线上功能抽查（真实 Chrome） | 首页正常渲染（设备库/方言下拉）；实验六拓扑 2 设备；R1 终端 `enable` → `R1#`；`pageerror` 0。截图 `docs/cli-fidelity/pages-live-check.png` |
+| 旧站点 `halacrcrc.github.io/netemu/` | **404**（已按决策下线） |
+
+> 遗留观察（未处理，仅登记）：首次访问线上站点时偶发一次空渲染，重载后正常；同次 `net_sim_bg-*.wasm` 出现一条 `net::ERR_ABORTED`（`service worker` 预缓存与模块加载竞争的可能），功能抽查未受影响。
