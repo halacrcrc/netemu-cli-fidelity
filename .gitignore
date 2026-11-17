@@ -22,3 +22,6 @@ docs/华讯模板文档生成指南.md
 
 # 生成的 docx 内嵌公司模板资产（页眉横幅/样式/页脚），同样不入公共仓库
 网工模拟器使用与实验指南.docx
+
+# 浏览器冒烟临时快照（playwright-cli）
+.playwright-cli/
