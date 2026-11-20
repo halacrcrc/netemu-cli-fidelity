@@ -711,6 +711,125 @@ fn h4_h5_syntax_help_completion_abbreviation_from_cnode() {
     assert!(full.device_output.contains("Established"));
 }
 
+/// VRP 终端 `?` 上下文帮助：候选一律来自**当前会话模式对应的 CNode**，纯读、不执行原命令。
+///
+/// 本测试守护前端 `?` 修复的服务端契约（前端按「原始输入 + `?`」发起请求）：
+/// `?` 在 `exec_line_result` 里先于解析被截获，因此 `system-view?` 只出帮助、不切视图；
+/// 帮助不写状态、不推进虚拟时间、不混入模拟器提示通道。断言只做字段/结构/状态级，
+/// 不断言逐字空格与列宽（无带版本 VRP 设备样本）。
+#[test]
+fn vrp_context_help_user_and_system_views_from_cnode() {
+    let mut net = Net::new();
+    let r1 = net.add_device("R1".into(), DeviceKind::Router, Dialect::Vrp);
+    let mut eng = Engine::new(net);
+    let mut s = Session::default();
+    assert_eq!(s.mode, Mode::Exec, "新会话应处于 VRP 用户视图");
+    let before = state_fingerprint(&eng);
+    let now = eng.now_ns();
+
+    // 1) 用户视图单按 `?`：列出根候选，纯读。
+    let h = exec_line_result(&mut eng, &mut s, r1, "?");
+    assert_eq!(h.status, CommandStatus::Executed, "{}", h.device_output);
+    for w in ["system-view", "display", "ping"] {
+        assert!(
+            h.device_output.contains(w),
+            "用户视图 `?` 缺候选 {w}: {}",
+            h.device_output
+        );
+    }
+    assert!(!h.state_changed, "帮助不得改变状态");
+    assert_eq!(state_fingerprint(&eng), before, "帮助不得改变配置/拓扑");
+    assert_eq!(eng.now_ns(), now, "帮助不得推进虚拟时间");
+    assert!(
+        scan_simulator_wording(&h.device_output).is_empty(),
+        "帮助文本混入模拟器措辞: {}",
+        h.device_output
+    );
+    assert!(
+        !h.device_output.contains("[netemu]"),
+        "帮助文本不得伪造模拟器提示: {}",
+        h.device_output
+    );
+
+    // 2) 用户视图 `display ?`：列出 display 子节点，而不是当作普通命令解析。
+    let h = exec_line_result(&mut eng, &mut s, r1, "display ?");
+    assert_eq!(h.status, CommandStatus::Executed, "{}", h.device_output);
+    assert!(
+        h.device_output.contains("current-configuration"),
+        "`display ?` 应列出既有子命令: {}",
+        h.device_output
+    );
+    assert!(
+        !h.device_output.contains("Error"),
+        "`display ?` 不得落到命令错误: {}",
+        h.device_output
+    );
+    assert!(!h.state_changed);
+
+    // 3) 用户视图 `dis?`：前缀帮助，不执行、不补全。
+    let h = exec_line_result(&mut eng, &mut s, r1, "dis?");
+    assert_eq!(h.status, CommandStatus::Executed, "{}", h.device_output);
+    assert!(
+        h.device_output.contains("display"),
+        "`dis?` 应给前缀候选: {}",
+        h.device_output
+    );
+    assert_eq!(s.mode, Mode::Exec, "帮助请求不得切换视图");
+    assert_eq!(state_fingerprint(&eng), before);
+
+    // 4) 用户视图 `system-view?`：只显示帮助，绝不进入系统视图。
+    let h = exec_line_result(&mut eng, &mut s, r1, "system-view?");
+    assert_eq!(h.status, CommandStatus::Executed, "{}", h.device_output);
+    assert!(
+        h.device_output.contains("system-view"),
+        "`system-view?` 应给前缀候选: {}",
+        h.device_output
+    );
+    assert_eq!(s.mode, Mode::Exec, "`system-view?` 不得进入 Mode::Config");
+    assert!(!h.state_changed);
+    assert_eq!(state_fingerprint(&eng), before, "帮助不得改变配置");
+    assert_eq!(eng.now_ns(), now);
+
+    // 5) 正常进入系统视图后单按 `?`：候选来自 config 根 CNode。
+    let r = exec_and_run_result(&mut eng, &mut s, r1, "system-view");
+    ok(&r, "进入 VRP 系统视图");
+    assert_eq!(s.mode, Mode::Config);
+    let cfg_before = state_fingerprint(&eng);
+    let h = exec_line_result(&mut eng, &mut s, r1, "?");
+    assert_eq!(h.status, CommandStatus::Executed, "{}", h.device_output);
+    for w in ["sysname", "interface", "undo"] {
+        assert!(
+            h.device_output.contains(w),
+            "系统视图 `?` 缺候选 {w}: {}",
+            h.device_output
+        );
+    }
+    assert!(!h.state_changed);
+    assert_eq!(state_fingerprint(&eng), cfg_before);
+    assert!(
+        scan_simulator_wording(&h.device_output).is_empty(),
+        "系统视图帮助混入模拟器措辞: {}",
+        h.device_output
+    );
+
+    // 6) 系统视图 `display ?` / `display c?`：同一棵 CNode，前缀形式同样可用。
+    let h = exec_line_result(&mut eng, &mut s, r1, "display ?");
+    assert_eq!(h.status, CommandStatus::Executed, "{}", h.device_output);
+    assert!(
+        h.device_output.contains("current-configuration"),
+        "系统视图 `display ?` 应列出子命令: {}",
+        h.device_output
+    );
+    let hf = exec_line_result(&mut eng, &mut s, r1, "display c?");
+    assert_eq!(hf.status, CommandStatus::Executed, "{}", hf.device_output);
+    assert!(
+        hf.device_output.contains("current-configuration"),
+        "系统视图 `display c?` 应给前缀候选: {}",
+        hf.device_output
+    );
+    assert_eq!(state_fingerprint(&eng), cfg_before, "帮助不得改变配置");
+}
+
 // =====================================================================
 // H5：VRP ACL / Route-Policy / BGP 引入策略
 // =====================================================================

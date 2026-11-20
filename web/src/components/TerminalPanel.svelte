@@ -142,10 +142,13 @@
         return;
       }
       case '?': {
+        // `?` 只是临时查询：回显后按「原始输入 + ?」请求既有帮助，`?` 不写入编辑缓冲区。
+        // 帮助渲染完按原样恢复输入（含尾随空格），不 trimEnd、不提交、不记历史、不执行原命令。
+        const originalBuffer = ed.buffer;
         ed.term.write('?');
-        const out = execCommandResult(getSim(), ed.dev, ed.buffer).deviceOutput;
+        const out = execCommandResult(getSim(), ed.dev, originalBuffer + '?').deviceOutput;
         if (out) ed.term.write('\r\n' + out);
-        ed.buffer = ed.buffer.replace(/[?]/g, '').trimEnd();
+        ed.buffer = originalBuffer;
         ed.term.write('\r\n' + promptOf(getSim(), ed.dev) + ed.buffer);
         return;
       }
